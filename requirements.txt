@@ -1,0 +1,40 @@
+# ShareX - Secure File Sharing for Termux
+# Python 3.12+ required
+
+# Terminal UI Framework
+textual>=0.52.0
+rich>=13.7.0
+
+# Cryptography
+cryptography>=42.0.0
+
+# Async file operations
+aiofiles>=23.2.0
+
+# Network discovery (mDNS/Zeroconf)
+zeroconf>=0.131.0
+
+# System monitoring
+psutil>=5.9.0
+
+# QR Code generation
+qrcode>=7.4.0
+pillow>=10.2.0
+
+# Web Share HTTP Server
+aiohttp>=3.9.0
+
+# Async framework (built-in for Python 3.12+)
+# asyncio is part of standard library
+
+# Type hints (built-in for Python 3.12+)
+# typing is part of standard library
+
+# SQLite3 (built-in for Python 3.12+)
+# sqlite3 is part of standard library
+
+# Path handling (built-in for Python 3.12+)
+# pathlib is part of standard library
+
+# Data classes (built-in for Python 3.12+)
+# dataclasses is part of standard library
