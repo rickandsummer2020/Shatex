@@ -1,7 +1,9 @@
 """Web Share Manager for ShareX.
 
 Manages web share sessions including server lifecycle,
-QR code generation, and upload approvals.
+QR code generation, upload approvals, and browser session tracking.
+
+ENHANCED: Browser session management, live status queries.
 """
 
 import os
@@ -18,7 +20,7 @@ from qrcode.image.styles.moduledrawers import SquareModuleDrawer
 
 from ..models.webshare import WebShareSession, WebShareStatus
 from ..models.file_info import FileInfo
-from ..services.webshare_server import WebShareServer, UploadRequest
+from ..services.webshare_server import WebShareServer, UploadRequest, BrowserSession
 from ..config import get_config
 
 logger = logging.getLogger(__name__)
@@ -28,30 +30,34 @@ class WebShareManager:
     """Manages web share functionality.
 
     Handles session creation, server management, QR code
-    generation, and upload approval workflow.
+    generation, upload approval workflow, and browser session tracking.
 
     Attributes:
         current_session: Active web share session.
         server: WebShareServer instance.
         on_upload_request: Callback for upload approval.
         on_status_change: Callback for status changes.
+        on_browser_update: Callback for browser session changes.
     """
 
     def __init__(
         self,
         on_upload_request: Optional[Callable[[UploadRequest], asyncio.Future]] = None,
         on_status_change: Optional[Callable[[WebShareStatus], None]] = None,
+        on_browser_update: Optional[Callable[[List[BrowserSession]], None]] = None,
     ) -> None:
         """Initialize web share manager.
 
         Args:
             on_upload_request: Callback for upload approval.
             on_status_change: Callback for status changes.
+            on_browser_update: Callback for browser session changes.
         """
         self.current_session: Optional[WebShareSession] = None
         self.server: Optional[WebShareServer] = None
         self.on_upload_request = on_upload_request
         self.on_status_change = on_status_change
+        self.on_browser_update = on_browser_update
         self._lock = asyncio.Lock()
         logger.info("WebShareManager initialized")
 
@@ -137,6 +143,7 @@ class WebShareManager:
                 session=self.current_session,
                 on_upload_request=self.on_upload_request,
                 on_status_change=self._handle_status_change,
+                on_browser_update=self._handle_browser_update,  # NEW
             )
             await self.server.start()
 
@@ -199,6 +206,54 @@ class WebShareManager:
             return []
         return self.server.get_pending_uploads()
 
+    # =====================================================================
+    # BROWSER SESSION QUERIES (NEW)
+    # =====================================================================
+
+    def get_browser_sessions(self) -> List[BrowserSession]:
+        """Get active browser sessions.
+
+        Returns:
+            List of active BrowserSession objects.
+        """
+        if not self.server:
+            return []
+        return self.server.get_active_browser_sessions()
+
+    def get_browser_count(self) -> int:
+        """Get count of active browser sessions.
+
+        Returns:
+            Number of active browser sessions.
+        """
+        if not self.server:
+            return 0
+        return self.server.get_browser_session_count()
+
+    def get_browser_summary(self) -> dict:
+        """Get summary of browser connections.
+
+        Returns:
+            Dictionary with browser statistics.
+        """
+        sessions = self.get_browser_sessions()
+        if not sessions:
+            return {
+                "count": 0,
+                "browsers": [],
+                "total_downloads": 0,
+                "total_uploads": 0,
+                "total_bytes": 0,
+            }
+
+        return {
+            "count": len(sessions),
+            "browsers": [s.to_dict() for s in sessions],
+            "total_downloads": sum(s.files_downloaded for s in sessions),
+            "total_uploads": sum(s.files_uploaded for s in sessions),
+            "total_bytes": sum(s.bytes_transferred for s in sessions),
+        }
+
     def get_qr_code_lines(self) -> List[str]:
         """Get QR code as list of strings for terminal display.
 
@@ -222,6 +277,20 @@ class WebShareManager:
                 self.on_status_change(status)
             except Exception as e:
                 logger.error(f"Status change callback error: {e}")
+
+    def _handle_browser_update(self, sessions: List[BrowserSession]) -> None:
+        """Handle browser session updates.
+
+        NEW: Propagates browser session changes to UI.
+
+        Args:
+            sessions: Updated list of browser sessions.
+        """
+        if self.on_browser_update:
+            try:
+                self.on_browser_update(sessions)
+            except Exception as e:
+                logger.error(f"Browser update callback error: {e}")
 
     @staticmethod
     def _get_local_ip() -> str:
@@ -369,6 +438,9 @@ class WebShareManager:
         if not self.current_session:
             return {}
 
+        # NEW: Include browser information
+        browser_summary = self.get_browser_summary()
+
         return {
             "id": self.current_session.id,
             "url": self.current_session.url,
@@ -378,4 +450,10 @@ class WebShareManager:
             "files_count": len(self.current_session.files),
             "uploaded_count": len(self.current_session.uploaded_files),
             "duration": self.current_session.formatted_duration,
+            # NEW: Browser info
+            "browser_count": browser_summary["count"],
+            "browser_sessions": browser_summary["browsers"],
+            "total_browser_downloads": browser_summary["total_downloads"],
+            "total_browser_uploads": browser_summary["total_uploads"],
+            "total_browser_bytes": browser_summary["total_bytes"],
         }
