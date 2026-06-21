@@ -1,16 +1,19 @@
-"""Web Share model for ShareX.
+"""Web Share models for ShareX.
 
-Represents an active web sharing session.
+Defines data structures for web share sessions and status.
+
+ENHANCED: Browser session tracking fields.
 """
 
 import time
 from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
 from enum import Enum
-from typing import Optional, Dict, Any, List
 
 
 class WebShareStatus(Enum):
     """Web share session status."""
+    INACTIVE = "inactive"
     STARTING = "starting"
     ACTIVE = "active"
     STOPPING = "stopping"
@@ -20,90 +23,120 @@ class WebShareStatus(Enum):
 
 @dataclass
 class WebShareSession:
-    """Represents a web sharing session.
+    """Represents an active web share session.
+
+    Manages shared files, uploaded files, and browser connection state.
+
+    ENHANCED: Added browser session tracking fields.
 
     Attributes:
         id: Unique session identifier.
+        ip_address: Server IP address.
+        port: Server port.
+        url: Full URL for accessing the web share.
         status: Current session status.
-        ip_address: Local IP address.
-        port: HTTP server port.
-        url: Full download URL.
-        qr_code: ASCII QR code representation.
-        files: List of shared files.
-        uploaded_files: List of received files.
-        max_upload_size: Maximum upload size in bytes.
-        allow_upload: Whether to allow file uploads.
+        allow_upload: Whether uploads are allowed.
         require_password: Whether password is required.
-        password: Session password.
-        expires_at: Session expiration timestamp.
+        password: Optional session password.
+        expires_at: Optional expiration timestamp.
+        files: List of shared files.
+        uploaded_files: List of uploaded files.
+        qr_code: ASCII QR code string.
         created_at: Session creation timestamp.
-        metadata: Additional session information.
+        browser_count: Number of active browser sessions.
+        browser_sessions: List of active browser session dicts.
+        total_browser_downloads: Total downloads across all browsers.
+        total_browser_uploads: Total uploads across all browsers.
+        total_browser_bytes: Total bytes transferred across all browsers.
     """
 
     id: str
     ip_address: str
     port: int
     url: str
-    status: WebShareStatus = WebShareStatus.STARTING
-    qr_code: Optional[str] = None
-    files: List[Dict[str, Any]] = field(default_factory=list)
-    uploaded_files: List[Dict[str, Any]] = field(default_factory=list)
-    max_upload_size: int = 1073741824  # 1GB default
+    status: WebShareStatus = WebShareStatus.INACTIVE
     allow_upload: bool = True
     require_password: bool = False
     password: Optional[str] = None
     expires_at: Optional[float] = None
+    files: List[Dict[str, Any]] = field(default_factory=list)
+    uploaded_files: List[Dict[str, Any]] = field(default_factory=list)
+    qr_code: str = ""
     created_at: float = field(default_factory=time.time)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    max_upload_size: int = 100 * 1024 * 1024  # 100MB default
 
-    def __post_init__(self) -> None:
-        """Validate session data after initialization."""
-        if not self.id:
-            raise ValueError("Session ID cannot be empty")
-        if not self.ip_address:
-            raise ValueError("IP address cannot be empty")
-        if not self.url:
-            raise ValueError("URL cannot be empty")
+    # NEW: Browser session tracking fields
+    browser_count: int = 0
+    browser_sessions: List[Dict[str, Any]] = field(default_factory=list)
+    total_browser_downloads: int = 0
+    total_browser_uploads: int = 0
+    total_browser_bytes: int = 0
 
     @property
     def is_active(self) -> bool:
         """Check if session is active."""
-        return self.status == WebShareStatus.ACTIVE
+        if self.status != WebShareStatus.ACTIVE:
+            return False
+        if self.expires_at and time.time() > self.expires_at:
+            return False
+        return True
 
     @property
     def is_expired(self) -> bool:
         """Check if session has expired."""
-        if self.expires_at is None:
-            return False
-        return time.time() > self.expires_at
+        if self.expires_at:
+            return time.time() > self.expires_at
+        return False
 
     @property
     def duration(self) -> float:
-        """Get session duration in seconds."""
+        """Session duration in seconds."""
         return time.time() - self.created_at
 
     @property
     def formatted_duration(self) -> str:
-        """Get human-readable session duration."""
+        """Human-readable session duration."""
         duration = int(self.duration)
         if duration < 60:
             return f"{duration}s"
         elif duration < 3600:
-            minutes = duration // 60
-            secs = duration % 60
-            return f"{minutes}m {secs}s"
+            return f"{duration // 60}m {duration % 60}s"
         else:
-            hours = duration // 3600
-            minutes = (duration % 3600) // 60
-            return f"{hours}h {minutes}m"
+            return f"{duration // 3600}h {(duration % 3600) // 60}m"
 
-    def add_file(self, file_name: str, file_path: str, file_size: int) -> None:
-        """Add a file to the sharing session.
+    @property
+    def expires_in(self) -> Optional[int]:
+        """Seconds until expiration."""
+        if self.expires_at:
+            remaining = int(self.expires_at - time.time())
+            return max(0, remaining)
+        return None
+
+    @property
+    def formatted_expires_in(self) -> Optional[str]:
+        """Human-readable expiration time."""
+        expires = self.expires_in
+        if expires is None:
+            return None
+        if expires < 60:
+            return f"{expires}s"
+        elif expires < 3600:
+            return f"{expires // 60}m"
+        else:
+            return f"{expires // 3600}h {(expires % 3600) // 60}m"
+
+    def add_file(
+        self,
+        file_name: str,
+        file_path: str,
+        file_size: int,
+    ) -> None:
+        """Add a file to the session.
 
         Args:
-            file_name: Name of the file.
-            file_path: Path to the file.
-            file_size: Size of the file in bytes.
+            file_name: Display name of the file.
+            file_path: Absolute path to the file.
+            file_size: File size in bytes.
         """
         self.files.append({
             "name": file_name,
@@ -112,14 +145,34 @@ class WebShareSession:
             "added_at": time.time(),
         })
 
-    def add_uploaded_file(self, file_name: str, file_path: str, file_size: int, 
-                         uploader_ip: Optional[str] = None) -> None:
+    def remove_file(self, file_name: str) -> bool:
+        """Remove a file from the session.
+
+        Args:
+            file_name: Name of the file to remove.
+
+        Returns:
+            True if file was removed.
+        """
+        for i, file_info in enumerate(self.files):
+            if file_info["name"] == file_name:
+                self.files.pop(i)
+                return True
+        return False
+
+    def add_uploaded_file(
+        self,
+        file_name: str,
+        file_path: str,
+        file_size: int,
+        uploader_ip: str,
+    ) -> None:
         """Add an uploaded file to the session.
 
         Args:
             file_name: Name of the uploaded file.
             file_path: Path where file was saved.
-            file_size: Size of the file in bytes.
+            file_size: Size of the uploaded file.
             uploader_ip: IP address of the uploader.
         """
         self.uploaded_files.append({
@@ -130,78 +183,51 @@ class WebShareSession:
             "uploaded_at": time.time(),
         })
 
-    def remove_file(self, file_name: str) -> bool:
-        """Remove a file from the sharing session.
+    # NEW: Update browser session information
+    def update_browser_info(
+        self,
+        count: int,
+        sessions: List[Dict[str, Any]],
+        total_downloads: int = 0,
+        total_uploads: int = 0,
+        total_bytes: int = 0,
+    ) -> None:
+        """Update browser session tracking information.
 
         Args:
-            file_name: Name of the file to remove.
-
-        Returns:
-            True if file was removed, False otherwise.
+            count: Number of active browser sessions.
+            sessions: List of browser session dictionaries.
+            total_downloads: Total downloads across all browsers.
+            total_uploads: Total uploads across all browsers.
+            total_bytes: Total bytes transferred across all browsers.
         """
-        for i, file in enumerate(self.files):
-            if file["name"] == file_name:
-                self.files.pop(i)
-                return True
-        return False
-
-    def get_total_size(self) -> int:
-        """Get total size of all shared files.
-
-        Returns:
-            Total size in bytes.
-        """
-        return sum(file["size"] for file in self.files)
-
-    def get_uploaded_total_size(self) -> int:
-        """Get total size of all uploaded files.
-
-        Returns:
-            Total size in bytes.
-        """
-        return sum(file["size"] for file in self.uploaded_files)
+        self.browser_count = count
+        self.browser_sessions = sessions
+        self.total_browser_downloads = total_downloads
+        self.total_browser_uploads = total_uploads
+        self.total_browser_bytes = total_bytes
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert session to dictionary."""
+        """Convert session to dictionary.
+
+        Returns:
+            Dictionary representation.
+        """
         return {
             "id": self.id,
-            "status": self.status.value,
-            "ip_address": self.ip_address,
-            "port": self.port,
             "url": self.url,
-            "qr_code": self.qr_code,
-            "files": self.files,
-            "uploaded_files": self.uploaded_files,
-            "max_upload_size": self.max_upload_size,
+            "status": self.status.value,
+            "is_active": self.is_active,
             "allow_upload": self.allow_upload,
             "require_password": self.require_password,
-            "password": self.password,
-            "expires_at": self.expires_at,
-            "created_at": self.created_at,
-            "metadata": self.metadata,
+            "files_count": len(self.files),
+            "uploaded_count": len(self.uploaded_files),
+            "duration": self.formatted_duration,
+            "expires_in": self.formatted_expires_in,
+            # NEW: Browser info
+            "browser_count": self.browser_count,
+            "browser_sessions": self.browser_sessions,
+            "total_browser_downloads": self.total_browser_downloads,
+            "total_browser_uploads": self.total_browser_uploads,
+            "total_browser_bytes": self.total_browser_bytes,
         }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "WebShareSession":
-        """Create session from dictionary."""
-        return cls(
-            id=data["id"],
-            ip_address=data["ip_address"],
-            port=data["port"],
-            url=data["url"],
-            status=WebShareStatus(data.get("status", "starting")),
-            qr_code=data.get("qr_code"),
-            files=data.get("files", []),
-            uploaded_files=data.get("uploaded_files", []),
-            max_upload_size=data.get("max_upload_size", 1073741824),
-            allow_upload=data.get("allow_upload", True),
-            require_password=data.get("require_password", False),
-            password=data.get("password"),
-            expires_at=data.get("expires_at"),
-            created_at=data.get("created_at", time.time()),
-            metadata=data.get("metadata", {}),
-        )
-
-    def __str__(self) -> str:
-        """String representation."""
-        return f"WebShare({self.url}) - {self.status.value}"
