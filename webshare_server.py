@@ -3,6 +3,9 @@
 Provides a lightweight HTTP server that allows any device
 with a web browser to download and upload files without
 installing ShareX.
+
+ENHANCED: Browser session support, detection, connection management,
+live browser status, and WebSocket preparation.
 """
 
 import os
@@ -13,9 +16,12 @@ import logging
 import hashlib
 import tempfile
 import shutil
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from datetime import datetime
 
 import aiohttp
 from aiohttp import web
@@ -31,7 +37,214 @@ from ..config import get_config
 logger = logging.getLogger(__name__)
 
 
-# Mobile-friendly HTML template - completely self-contained, no external dependencies
+# =============================================================================
+# BROWSER SESSION MANAGEMENT
+# =============================================================================
+
+class BrowserType(Enum):
+    """Detected browser types."""
+    CHROME = "chrome"
+    FIREFOX = "firefox"
+    SAFARI = "safari"
+    EDGE = "edge"
+    OPERA = "opera"
+    SAMSUNG = "samsung"
+    UNKNOWN = "unknown"
+
+
+class PlatformType(Enum):
+    """Detected platform types."""
+    WINDOWS = "windows"
+    MACOS = "macos"
+    LINUX = "linux"
+    ANDROID = "android"
+    IOS = "ios"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class BrowserSession:
+    """Represents an active browser connection session.
+
+    Tracks individual browser instances connected to the web share.
+    """
+    id: str
+    ip_address: str
+    user_agent: str
+    browser_type: BrowserType = BrowserType.UNKNOWN
+    platform_type: PlatformType = PlatformType.UNKNOWN
+    browser_version: str = ""
+    connected_at: float = field(default_factory=time.time)
+    last_activity: float = field(default_factory=time.time)
+    is_active: bool = True
+    page_views: int = 0
+    files_downloaded: int = 0
+    files_uploaded: int = 0
+    bytes_transferred: int = 0
+
+    @property
+    def duration(self) -> float:
+        """Session duration in seconds."""
+        return time.time() - self.connected_at
+
+    @property
+    def formatted_duration(self) -> str:
+        """Human-readable session duration."""
+        duration = int(self.duration)
+        if duration < 60:
+            return f"{duration}s"
+        elif duration < 3600:
+            return f"{duration // 60}m {duration % 60}s"
+        else:
+            return f"{duration // 3600}h {(duration % 3600) // 60}m"
+
+    @property
+    def display_name(self) -> str:
+        """User-friendly browser display name."""
+        browser_name = self.browser_type.value.title()
+        platform_name = self.platform_type.value.title()
+        return f"{browser_name} on {platform_name}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "id": self.id,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent[:100] + "..." if len(self.user_agent) > 100 else self.user_agent,
+            "browser_type": self.browser_type.value,
+            "platform_type": self.platform_type.value,
+            "browser_version": self.browser_version,
+            "connected_at": self.connected_at,
+            "last_activity": self.last_activity,
+            "is_active": self.is_active,
+            "page_views": self.page_views,
+            "files_downloaded": self.files_downloaded,
+            "files_uploaded": self.files_uploaded,
+            "bytes_transferred": self.bytes_transferred,
+            "duration": self.formatted_duration,
+            "display_name": self.display_name,
+        }
+
+
+class BrowserDetector:
+    """Detects browser type and platform from User-Agent string."""
+
+    # Browser detection patterns
+    BROWSER_PATTERNS = {
+        BrowserType.SAMSUNG: r"SamsungBrowser\/(\d+\.\d+)",
+        BrowserType.OPERA: r"OPR\/(\d+\.\d+)",
+        BrowserType.EDGE: r"Edg\/(\d+\.\d+)",
+        BrowserType.CHROME: r"Chrome\/(\d+\.\d+)",
+        BrowserType.FIREFOX: r"Firefox\/(\d+\.\d+)",
+        BrowserType.SAFARI: r"Version\/(\d+\.\d+).*Safari",
+    }
+
+    # Platform detection patterns
+    PLATFORM_PATTERNS = {
+        PlatformType.ANDROID: r"Android",
+        PlatformType.IOS: r"(iPhone|iPad|iPod)",
+        PlatformType.WINDOWS: r"Windows",
+        PlatformType.MACOS: r"(Mac OS X|macOS)",
+        PlatformType.LINUX: r"Linux",
+    }
+
+    @classmethod
+    def detect(cls, user_agent: str) -> tuple[BrowserType, PlatformType, str]:
+        """Detect browser type, platform, and version from User-Agent.
+
+        Args:
+            user_agent: The User-Agent string from HTTP headers.
+
+        Returns:
+            Tuple of (BrowserType, PlatformType, version_string).
+        """
+        if not user_agent:
+            return BrowserType.UNKNOWN, PlatformType.UNKNOWN, ""
+
+        # Detect browser (check in priority order)
+        browser_type = BrowserType.UNKNOWN
+        browser_version = ""
+        for browser, pattern in cls.BROWSER_PATTERNS.items():
+            match = re.search(pattern, user_agent)
+            if match:
+                browser_type = browser
+                browser_version = match.group(1) if match.groups() else ""
+                break
+
+        # Detect platform
+        platform_type = PlatformType.UNKNOWN
+        for platform, pattern in cls.PLATFORM_PATTERNS.items():
+            if re.search(pattern, user_agent):
+                platform_type = platform
+                break
+
+        return browser_type, platform_type, browser_version
+
+
+# =============================================================================
+# WEBSOCKET PREPARATION
+# =============================================================================
+
+@dataclass
+class WebSocketPreparedMessage:
+    """Pre-structured WebSocket message format for future use.
+
+    This dataclass defines the message structure that will be used
+    when WebSocket support is fully implemented.
+    """
+    type: str  # "status", "file_update", "browser_update", "upload_progress"
+    timestamp: float = field(default_factory=time.time)
+    data: Dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        """Serialize to JSON string."""
+        return json.dumps({
+            "type": self.type,
+            "timestamp": self.timestamp,
+            "data": self.data,
+        })
+
+    @classmethod
+    def browser_update(cls, sessions: List[BrowserSession]) -> "WebSocketPreparedMessage":
+        """Create a browser update message."""
+        return cls(
+            type="browser_update",
+            data={
+                "count": len(sessions),
+                "browsers": [s.to_dict() for s in sessions],
+            }
+        )
+
+    @classmethod
+    def file_update(cls, files: List[Dict], uploaded_files: List[Dict]) -> "WebSocketPreparedMessage":
+        """Create a file list update message."""
+        return cls(
+            type="file_update",
+            data={
+                "files_count": len(files),
+                "uploaded_count": len(uploaded_files),
+                "files": files,
+                "uploaded_files": uploaded_files,
+            }
+        )
+
+    @classmethod
+    def status_update(cls, status: str, url: str) -> "WebSocketPreparedMessage":
+        """Create a server status update message."""
+        return cls(
+            type="status_update",
+            data={
+                "status": status,
+                "url": url,
+                "timestamp": time.time(),
+            }
+        )
+
+
+# =============================================================================
+# HTML TEMPLATE (ENHANCED WITH BROWSER INFO)
+# =============================================================================
+
 WEB_UI_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -77,9 +290,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
             align-items: center;
             gap: 8px;
         }
-        .file-list {
-            list-style: none;
-        }
+        .file-list { list-style: none; }
         .file-item {
             display: flex;
             align-items: center;
@@ -90,10 +301,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
             margin-bottom: 8px;
             border: 1px solid #0f3460;
         }
-        .file-info {
-            flex: 1;
-            min-width: 0;
-        }
+        .file-info { flex: 1; min-width: 0; }
         .file-name {
             font-size: 0.9rem;
             color: #eaeaea;
@@ -102,10 +310,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
             text-overflow: ellipsis;
             margin-bottom: 4px;
         }
-        .file-size {
-            font-size: 0.75rem;
-            color: #a0a0a0;
-        }
+        .file-size { font-size: 0.75rem; color: #a0a0a0; }
         .btn {
             display: inline-flex;
             align-items: center;
@@ -120,25 +325,13 @@ WEB_UI_HTML = """<!DOCTYPE html>
             text-decoration: none;
             gap: 6px;
         }
-        .btn-primary {
-            background: #00d9ff;
-            color: #0f0f23;
-        }
+        .btn-primary { background: #00d9ff; color: #0f0f23; }
         .btn-primary:hover { background: #33e0ff; }
-        .btn-success {
-            background: #00ff88;
-            color: #0f0f23;
-        }
+        .btn-success { background: #00ff88; color: #0f0f23; }
         .btn-success:hover { background: #33ffaa; }
-        .btn-danger {
-            background: #e94560;
-            color: #fff;
-        }
+        .btn-danger { background: #e94560; color: #fff; }
         .btn-danger:hover { background: #ff6b81; }
-        .btn-sm {
-            padding: 6px 12px;
-            font-size: 0.8rem;
-        }
+        .btn-sm { padding: 6px 12px; font-size: 0.8rem; }
         .upload-area {
             border: 2px dashed #0f3460;
             border-radius: 12px;
@@ -151,24 +344,11 @@ WEB_UI_HTML = """<!DOCTYPE html>
             border-color: #00d9ff;
             background: rgba(0, 217, 255, 0.05);
         }
-        .upload-icon {
-            font-size: 2.5rem;
-            margin-bottom: 12px;
-        }
-        .upload-text {
-            font-size: 1rem;
-            color: #eaeaea;
-            margin-bottom: 8px;
-        }
-        .upload-hint {
-            font-size: 0.8rem;
-            color: #a0a0a0;
-        }
+        .upload-icon { font-size: 2.5rem; margin-bottom: 12px; }
+        .upload-text { font-size: 1rem; color: #eaeaea; margin-bottom: 8px; }
+        .upload-hint { font-size: 0.8rem; color: #a0a0a0; }
         #file-input { display: none; }
-        .progress-container {
-            display: none;
-            margin-top: 16px;
-        }
+        .progress-container { display: none; margin-top: 16px; }
         .progress-bar {
             width: 100%;
             height: 8px;
@@ -184,11 +364,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
             transition: width 0.3s;
             width: 0%;
         }
-        .progress-text {
-            font-size: 0.8rem;
-            color: #a0a0a0;
-            text-align: center;
-        }
+        .progress-text { font-size: 0.8rem; color: #a0a0a0; text-align: center; }
         .file-preview {
             display: flex;
             align-items: center;
@@ -199,26 +375,10 @@ WEB_UI_HTML = """<!DOCTYPE html>
             margin-bottom: 8px;
             font-size: 0.85rem;
         }
-        .file-preview-name {
-            flex: 1;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .file-preview-size {
-            color: #a0a0a0;
-            font-size: 0.75rem;
-        }
-        .empty-state {
-            text-align: center;
-            padding: 40px 20px;
-            color: #a0a0a0;
-        }
-        .empty-state-icon {
-            font-size: 3rem;
-            margin-bottom: 16px;
-            opacity: 0.5;
-        }
+        .file-preview-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .file-preview-size { color: #a0a0a0; font-size: 0.75rem; }
+        .empty-state { text-align: center; padding: 40px 20px; color: #a0a0a0; }
+        .empty-state-icon { font-size: 3rem; margin-bottom: 16px; opacity: 0.5; }
         .status-badge {
             display: inline-block;
             padding: 4px 10px;
@@ -226,16 +386,8 @@ WEB_UI_HTML = """<!DOCTYPE html>
             font-size: 0.75rem;
             font-weight: 600;
         }
-        .status-active {
-            background: rgba(0, 255, 136, 0.2);
-            color: #00ff88;
-        }
-        .footer {
-            text-align: center;
-            padding: 20px;
-            font-size: 0.75rem;
-            color: #666;
-        }
+        .status-active { background: rgba(0, 255, 136, 0.2); color: #00ff88; }
+        .footer { text-align: center; padding: 20px; font-size: 0.75rem; color: #666; }
         .toast {
             position: fixed;
             bottom: 20px;
@@ -253,6 +405,17 @@ WEB_UI_HTML = """<!DOCTYPE html>
             pointer-events: none;
         }
         .toast.show { opacity: 1; }
+        /* Browser info section */
+        .browser-info {
+            background: #0f0f23;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            border: 1px solid #0f3460;
+            font-size: 0.8rem;
+        }
+        .browser-info .browser-name { color: #00d9ff; font-weight: 600; }
+        .browser-info .browser-details { color: #a0a0a0; }
         @media (max-width: 400px) {
             body { padding: 12px; }
             .header h1 { font-size: 1.2rem; }
@@ -508,13 +671,19 @@ class WebShareServer:
     Allows any device with a web browser to download and
     upload files without installing ShareX.
 
+    ENHANCED: Browser session tracking, detection, live status,
+    and WebSocket preparation.
+
     Attributes:
         session: Current web share session.
         on_upload_request: Callback for upload approval.
         on_status_change: Callback for status changes.
+        on_browser_update: Callback for browser session changes.
         _app: aiohttp application instance.
         _runner: aiohttp server runner.
         _site: aiohttp server site.
+        _browser_sessions: Active browser connections.
+        _browser_cleanup_task: Periodic cleanup task.
     """
 
     def __init__(
@@ -522,6 +691,7 @@ class WebShareServer:
         session: WebShareSession,
         on_upload_request: Optional[Callable[[UploadRequest], asyncio.Future]] = None,
         on_status_change: Optional[Callable[[WebShareStatus], None]] = None,
+        on_browser_update: Optional[Callable[[List[BrowserSession]], None]] = None,
     ) -> None:
         """Initialize web share server.
 
@@ -529,17 +699,222 @@ class WebShareServer:
             session: Web share session configuration.
             on_upload_request: Callback triggered when upload needs approval.
             on_status_change: Callback triggered on status changes.
+            on_browser_update: Callback triggered when browser sessions change.
         """
         self.session = session
         self.on_upload_request = on_upload_request
         self.on_status_change = on_status_change
+        self.on_browser_update = on_browser_update
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._pending_uploads: Dict[str, UploadRequest] = {}
         self._upload_futures: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
+
+        # Browser session management
+        self._browser_sessions: Dict[str, BrowserSession] = {}
+        self._browser_cleanup_task: Optional[asyncio.Task] = None
+        self._browser_lock = asyncio.Lock()
+        self._browser_session_timeout: float = 300.0  # 5 minutes
+
         logger.info(f"WebShareServer initialized for session {session.id}")
+
+    # =====================================================================
+    # BROWSER SESSION MANAGEMENT
+    # =====================================================================
+
+    def _get_or_create_browser_session(self, request: web.Request) -> BrowserSession:
+        """Get existing or create new browser session for a request.
+
+        Args:
+            request: The HTTP request.
+
+        Returns:
+            BrowserSession for this client.
+        """
+        client_ip = request.remote or "unknown"
+        user_agent = request.headers.get("User-Agent", "")
+
+        # Create a session ID from IP + User-Agent hash
+        session_key = hashlib.sha256(
+            f"{client_ip}:{user_agent}".encode()
+        ).hexdigest()[:16]
+
+        # Check for existing session
+        existing = self._browser_sessions.get(session_key)
+        if existing and existing.is_active:
+            existing.last_activity = time.time()
+            existing.page_views += 1
+            return existing
+
+        # Detect browser info
+        browser_type, platform_type, version = BrowserDetector.detect(user_agent)
+
+        # Create new session
+        new_session = BrowserSession(
+            id=session_key,
+            ip_address=client_ip,
+            user_agent=user_agent,
+            browser_type=browser_type,
+            platform_type=platform_type,
+            browser_version=version,
+            page_views=1,
+        )
+
+        self._browser_sessions[session_key] = new_session
+        logger.info(f"New browser session: {new_session.display_name} from {client_ip}")
+
+        # Notify about browser update
+        if self.on_browser_update:
+            try:
+                self.on_browser_update(self.get_active_browser_sessions())
+            except Exception as e:
+                logger.error(f"Browser update callback error: {e}")
+
+        return new_session
+
+    def get_active_browser_sessions(self) -> List[BrowserSession]:
+        """Get list of currently active browser sessions.
+
+        Returns:
+            List of active BrowserSession objects.
+        """
+        current_time = time.time()
+        active = []
+        for session in self._browser_sessions.values():
+            if session.is_active and (current_time - session.last_activity) < self._browser_session_timeout:
+                active.append(session)
+        return active
+
+    def get_browser_session_count(self) -> int:
+        """Get count of active browser sessions.
+
+        Returns:
+            Number of active browser sessions.
+        """
+        return len(self.get_active_browser_sessions())
+
+    def _update_browser_activity(self, session_id: str, bytes_count: int = 0, 
+                                  download: bool = False, upload: bool = False) -> None:
+        """Update browser session activity metrics.
+
+        Args:
+            session_id: Browser session ID.
+            bytes_count: Bytes transferred.
+            download: Whether a download occurred.
+            upload: Whether an upload occurred.
+        """
+        session = self._browser_sessions.get(session_id)
+        if session:
+            session.last_activity = time.time()
+            session.bytes_transferred += bytes_count
+            if download:
+                session.files_downloaded += 1
+            if upload:
+                session.files_uploaded += 1
+
+    async def _browser_cleanup_loop(self) -> None:
+        """Periodic cleanup of stale browser sessions."""
+        try:
+            while self.session.status == WebShareStatus.ACTIVE:
+                await asyncio.sleep(30)  # Check every 30 seconds
+
+                current_time = time.time()
+                stale_sessions = []
+
+                for session_id, session in self._browser_sessions.items():
+                    if current_time - session.last_activity > self._browser_session_timeout:
+                        session.is_active = False
+                        stale_sessions.append(session_id)
+                        logger.info(f"Browser session expired: {session.display_name}")
+
+                if stale_sessions:
+                    for session_id in stale_sessions:
+                        self._browser_sessions.pop(session_id, None)
+
+                    # Notify about browser update
+                    if self.on_browser_update:
+                        try:
+                            self.on_browser_update(self.get_active_browser_sessions())
+                        except Exception as e:
+                            logger.error(f"Browser update callback error: {e}")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Browser cleanup error: {e}")
+
+    # =====================================================================
+    # WEBSOCKET PREPARATION
+    # =====================================================================
+
+    def _prepare_websocket_routes(self) -> None:
+        """Prepare WebSocket routes for future implementation.
+
+        This method sets up the route structure. Full WebSocket
+        implementation requires upgrading the connection.
+        """
+        if not self._app:
+            return
+
+        # Register WebSocket endpoint (prepared for future use)
+        self._app.router.add_get("/ws", self._handle_websocket)
+        logger.info("WebSocket endpoint prepared at /ws")
+
+    async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        """Handle WebSocket connection requests.
+
+        Currently returns a prepared response. Full implementation
+        will handle real-time bidirectional communication.
+
+        Args:
+            request: HTTP upgrade request.
+
+        Returns:
+            WebSocketResponse (prepared for future use).
+        """
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        logger.info(f"WebSocket connection prepared from {request.remote}")
+
+        # Send initial status message
+        status_msg = WebSocketPreparedMessage.status_update(
+            self.session.status.value,
+            self.session.url
+        )
+        await ws.send_str(status_msg.to_json())
+
+        # Keep connection alive for future implementation
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    # Handle incoming messages in future implementation
+                    logger.debug(f"WebSocket message: {msg.data}")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket error: {ws.exception()}")
+        except Exception as e:
+            logger.error(f"WebSocket handler error: {e}")
+        finally:
+            logger.info(f"WebSocket connection closed from {request.remote}")
+
+        return ws
+
+    def _broadcast_to_websockets(self, message: WebSocketPreparedMessage) -> None:
+        """Broadcast a message to all connected WebSocket clients.
+
+        Prepared for future use when WebSocket connections are tracked.
+
+        Args:
+            message: Message to broadcast.
+        """
+        # Future implementation will iterate over active WebSocket connections
+        logger.debug(f"WebSocket broadcast prepared: {message.type}")
+
+    # =====================================================================
+    # LIFECYCLE
+    # =====================================================================
 
     async def start(self) -> None:
         """Start the HTTP server."""
@@ -549,6 +924,7 @@ class WebShareServer:
 
             self._app = web.Application()
             self._setup_routes()
+            self._prepare_websocket_routes()  # NEW: WebSocket preparation
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
@@ -559,6 +935,11 @@ class WebShareServer:
                 self.session.port,
             )
             await self._site.start()
+
+            # Start browser cleanup loop
+            self._browser_cleanup_task = asyncio.create_task(
+                self._browser_cleanup_loop()
+            )
 
             self.session.status = WebShareStatus.ACTIVE
             self._notify_status_change()
@@ -575,6 +956,15 @@ class WebShareServer:
         try:
             self.session.status = WebShareStatus.STOPPING
             self._notify_status_change()
+
+            # Cancel browser cleanup
+            if self._browser_cleanup_task:
+                self._browser_cleanup_task.cancel()
+                try:
+                    await self._browser_cleanup_task
+                except asyncio.CancelledError:
+                    pass
+                self._browser_cleanup_task = None
 
             if self._site:
                 await self._site.stop()
@@ -600,6 +990,9 @@ class WebShareServer:
         self._app.router.add_post("/upload", self._handle_upload)
         self._app.router.add_get("/api/files", self._handle_api_files)
         self._app.router.add_get("/api/status", self._handle_api_status)
+        # NEW: Browser API endpoints
+        self._app.router.add_get("/api/browsers", self._handle_api_browsers)
+        self._app.router.add_get("/api/browsers/count", self._handle_api_browser_count)
         self._app.router.add_static("/downloads", path=get_config().config.download_folder, name="downloads")
 
     def _notify_status_change(self) -> None:
@@ -609,6 +1002,10 @@ class WebShareServer:
                 self.on_status_change(self.session.status)
             except Exception as e:
                 logger.error(f"Status change callback error: {e}")
+
+    # =====================================================================
+    # HANDLERS (ENHANCED WITH BROWSER TRACKING)
+    # =====================================================================
 
     async def _handle_index(self, request: web.Request) -> web.Response:
         """Handle main page request.
@@ -620,6 +1017,9 @@ class WebShareServer:
             HTML response.
         """
         try:
+            # Track browser session
+            browser_session = self._get_or_create_browser_session(request)
+
             config = get_config()
             device_name = config.config.device_name
 
@@ -641,7 +1041,11 @@ class WebShareServer:
 
             empty_display = "none" if self.session.files else "block"
             file_count = len(self.session.files)
-            connection_info = f"Connected from: {request.remote}"
+
+            # Enhanced connection info with browser detection
+            browser_count = self.get_browser_session_count()
+            browser_text = f"{browser_count} browser{'s' if browser_count != 1 else ''} connected"
+            connection_info = f"Connected from: {request.remote} | {browser_text}"
 
             html = WEB_UI_HTML.replace("{{device_name}}", device_name)
             html = html.replace("{{file_count}}", str(file_count))
@@ -666,6 +1070,9 @@ class WebShareServer:
             File response or error.
         """
         try:
+            # Track browser session
+            browser_session = self._get_or_create_browser_session(request)
+
             filename = request.match_info.get("filename", "")
             if not filename:
                 return web.Response(status=400, text="Filename required")
@@ -683,6 +1090,14 @@ class WebShareServer:
             file_path = Path(file_info["path"])
             if not file_path.exists():
                 return web.Response(status=404, text="File not found on server")
+
+            # Track download in browser session
+            file_size = file_info.get("size", 0)
+            self._update_browser_activity(
+                browser_session.id, 
+                bytes_count=file_size,
+                download=True
+            )
 
             # Stream file for large file support
             response = web.StreamResponse(
@@ -704,7 +1119,7 @@ class WebShareServer:
                     await response.write(chunk)
 
             await response.write_eof()
-            logger.info(f"File downloaded: {filename} by {request.remote}")
+            logger.info(f"File downloaded: {filename} by {request.remote} ({browser_session.display_name})")
             return response
 
         except Exception as e:
@@ -721,6 +1136,9 @@ class WebShareServer:
             JSON response indicating upload status.
         """
         try:
+            # Track browser session
+            browser_session = self._get_or_create_browser_session(request)
+
             reader = await request.multipart()
 
             filename = None
@@ -769,7 +1187,7 @@ class WebShareServer:
             filename = None
             session_id = None
             file_size = 0
-            
+
             try:
                 with open(temp_fd, "wb") as f:
                     async for part in reader:
@@ -876,6 +1294,13 @@ class WebShareServer:
                 uploader_ip=client_ip,
             )
 
+            # Track upload in browser session
+            self._update_browser_activity(
+                browser_session.id,
+                bytes_count=file_size,
+                upload=True
+            )
+
             # Clean up pending
             async with self._lock:
                 self._pending_uploads.pop(upload_id, None)
@@ -883,7 +1308,7 @@ class WebShareServer:
                 if future and not future.done():
                     future.set_result(True)
 
-            logger.info(f"File uploaded: {filename} ({self._format_size(file_size)}) from {client_ip}")
+            logger.info(f"File uploaded: {filename} ({self._format_size(file_size)}) from {client_ip} ({browser_session.display_name})")
 
             return web.json_response({
                 "success": True,
@@ -899,6 +1324,10 @@ class WebShareServer:
                 {"error": f"Upload failed: {str(e)}"},
                 status=500,
             )
+
+    # =====================================================================
+    # API HANDLERS (ENHANCED)
+    # =====================================================================
 
     async def _handle_api_files(self, request: web.Request) -> web.Response:
         """Handle API request for file list.
@@ -930,7 +1359,46 @@ class WebShareServer:
             "url": self.session.url,
             "files_count": len(self.session.files),
             "uploaded_count": len(self.session.uploaded_files),
+            # NEW: Browser session info
+            "browser_count": self.get_browser_session_count(),
+            "browser_sessions": [s.to_dict() for s in self.get_active_browser_sessions()],
         })
+
+    async def _handle_api_browsers(self, request: web.Request) -> web.Response:
+        """Handle API request for browser sessions.
+
+        NEW: Returns detailed browser session information.
+
+        Args:
+            request: HTTP request.
+
+        Returns:
+            JSON response with browser session list.
+        """
+        sessions = self.get_active_browser_sessions()
+        return web.json_response({
+            "count": len(sessions),
+            "browsers": [s.to_dict() for s in sessions],
+        })
+
+    async def _handle_api_browser_count(self, request: web.Request) -> web.Response:
+        """Handle API request for browser count.
+
+        NEW: Returns simple browser count.
+
+        Args:
+            request: HTTP request.
+
+        Returns:
+            JSON response with browser count.
+        """
+        return web.json_response({
+            "count": self.get_browser_session_count(),
+        })
+
+    # =====================================================================
+    # UPLOAD MANAGEMENT (UNCHANGED)
+    # =====================================================================
 
     def approve_upload(self, upload_id: str, approved: bool = True) -> bool:
         """Approve or reject a pending upload.
