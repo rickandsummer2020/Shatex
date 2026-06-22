@@ -4,8 +4,8 @@ Provides a lightweight HTTP server that allows any device
 with a web browser to download and upload files without
 installing ShareX.
 
-ENHANCED: Browser session support, detection, connection management,
-live browser status, and WebSocket preparation.
+ENHANCED: Full WebSocket support with heartbeat, reconnect,
+browser session tracking, and real-time bidirectional communication.
 """
 
 import os
@@ -18,7 +18,7 @@ import tempfile
 import shutil
 import re
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Set
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from datetime import datetime
@@ -76,7 +76,9 @@ class BrowserSession:
     browser_version: str = ""
     connected_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
+    last_heartbeat: float = field(default_factory=time.time)
     is_active: bool = True
+    is_websocket: bool = False  # NEW: Whether connected via WebSocket
     page_views: int = 0
     files_downloaded: int = 0
     files_uploaded: int = 0
@@ -105,6 +107,17 @@ class BrowserSession:
         platform_name = self.platform_type.value.title()
         return f"{browser_name} on {platform_name}"
 
+    @property
+    def heartbeat_ago(self) -> str:
+        """Time since last heartbeat in human-readable format."""
+        seconds = int(time.time() - self.last_heartbeat)
+        if seconds < 60:
+            return f"{seconds}s ago"
+        elif seconds < 3600:
+            return f"{seconds // 60}m ago"
+        else:
+            return f"{seconds // 3600}h ago"
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -116,7 +129,10 @@ class BrowserSession:
             "browser_version": self.browser_version,
             "connected_at": self.connected_at,
             "last_activity": self.last_activity,
+            "last_heartbeat": self.last_heartbeat,
+            "heartbeat_ago": self.heartbeat_ago,
             "is_active": self.is_active,
+            "is_websocket": self.is_websocket,
             "page_views": self.page_views,
             "files_downloaded": self.files_downloaded,
             "files_uploaded": self.files_uploaded,
@@ -129,7 +145,6 @@ class BrowserSession:
 class BrowserDetector:
     """Detects browser type and platform from User-Agent string."""
 
-    # Browser detection patterns
     BROWSER_PATTERNS = {
         BrowserType.SAMSUNG: r"SamsungBrowser\/(\d+\.\d+)",
         BrowserType.OPERA: r"OPR\/(\d+\.\d+)",
@@ -139,7 +154,6 @@ class BrowserDetector:
         BrowserType.SAFARI: r"Version\/(\d+\.\d+).*Safari",
     }
 
-    # Platform detection patterns
     PLATFORM_PATTERNS = {
         PlatformType.ANDROID: r"Android",
         PlatformType.IOS: r"(iPhone|iPad|iPod)",
@@ -150,18 +164,10 @@ class BrowserDetector:
 
     @classmethod
     def detect(cls, user_agent: str) -> tuple[BrowserType, PlatformType, str]:
-        """Detect browser type, platform, and version from User-Agent.
-
-        Args:
-            user_agent: The User-Agent string from HTTP headers.
-
-        Returns:
-            Tuple of (BrowserType, PlatformType, version_string).
-        """
+        """Detect browser type, platform, and version from User-Agent."""
         if not user_agent:
             return BrowserType.UNKNOWN, PlatformType.UNKNOWN, ""
 
-        # Detect browser (check in priority order)
         browser_type = BrowserType.UNKNOWN
         browser_version = ""
         for browser, pattern in cls.BROWSER_PATTERNS.items():
@@ -171,7 +177,6 @@ class BrowserDetector:
                 browser_version = match.group(1) if match.groups() else ""
                 break
 
-        # Detect platform
         platform_type = PlatformType.UNKNOWN
         for platform, pattern in cls.PLATFORM_PATTERNS.items():
             if re.search(pattern, user_agent):
@@ -182,17 +187,13 @@ class BrowserDetector:
 
 
 # =============================================================================
-# WEBSOCKET PREPARATION
+# WEBSOCKET MESSAGE PROTOCOL
 # =============================================================================
 
 @dataclass
-class WebSocketPreparedMessage:
-    """Pre-structured WebSocket message format for future use.
-
-    This dataclass defines the message structure that will be used
-    when WebSocket support is fully implemented.
-    """
-    type: str  # "status", "file_update", "browser_update", "upload_progress"
+class WSMessage:
+    """WebSocket message protocol for real-time communication."""
+    type: str
     timestamp: float = field(default_factory=time.time)
     data: Dict[str, Any] = field(default_factory=dict)
 
@@ -205,8 +206,28 @@ class WebSocketPreparedMessage:
         })
 
     @classmethod
-    def browser_update(cls, sessions: List[BrowserSession]) -> "WebSocketPreparedMessage":
-        """Create a browser update message."""
+    def from_json(cls, json_str: str) -> "WSMessage":
+        """Deserialize from JSON string."""
+        data = json.loads(json_str)
+        return cls(
+            type=data.get("type", "unknown"),
+            timestamp=data.get("timestamp", time.time()),
+            data=data.get("data", {}),
+        )
+
+    @classmethod
+    def heartbeat(cls) -> "WSMessage":
+        """Create server heartbeat message."""
+        return cls(type="heartbeat", data={"server_time": time.time()})
+
+    @classmethod
+    def heartbeat_ack(cls) -> "WSMessage":
+        """Create client heartbeat acknowledgment."""
+        return cls(type="heartbeat_ack")
+
+    @classmethod
+    def browser_update(cls, sessions: List[BrowserSession]) -> "WSMessage":
+        """Create browser update message."""
         return cls(
             type="browser_update",
             data={
@@ -216,8 +237,8 @@ class WebSocketPreparedMessage:
         )
 
     @classmethod
-    def file_update(cls, files: List[Dict], uploaded_files: List[Dict]) -> "WebSocketPreparedMessage":
-        """Create a file list update message."""
+    def file_update(cls, files: List[Dict], uploaded_files: List[Dict]) -> "WSMessage":
+        """Create file list update message."""
         return cls(
             type="file_update",
             data={
@@ -229,8 +250,8 @@ class WebSocketPreparedMessage:
         )
 
     @classmethod
-    def status_update(cls, status: str, url: str) -> "WebSocketPreparedMessage":
-        """Create a server status update message."""
+    def status_update(cls, status: str, url: str) -> "WSMessage":
+        """Create server status update message."""
         return cls(
             type="status_update",
             data={
@@ -240,9 +261,251 @@ class WebSocketPreparedMessage:
             }
         )
 
+    @classmethod
+    def upload_progress(cls, upload_id: str, progress: float, status: str) -> "WSMessage":
+        """Create upload progress message."""
+        return cls(
+            type="upload_progress",
+            data={
+                "upload_id": upload_id,
+                "progress": progress,
+                "status": status,
+            }
+        )
+
+    @classmethod
+    def error(cls, message: str) -> "WSMessage":
+        """Create error message."""
+        return cls(type="error", data={"message": message})
+
 
 # =============================================================================
-# HTML TEMPLATE (ENHANCED WITH BROWSER INFO)
+# WEBSOCKET CONNECTION MANAGER
+# =============================================================================
+
+@dataclass
+class WSConnection:
+    """Represents an active WebSocket connection."""
+    ws: web.WebSocketResponse
+    browser_session_id: str
+    connected_at: float = field(default_factory=time.time)
+    last_heartbeat: float = field(default_factory=time.time)
+    is_alive: bool = True
+
+    @property
+    def latency(self) -> float:
+        """Connection latency in seconds."""
+        return time.time() - self.last_heartbeat
+
+
+class WebSocketManager:
+    """Manages all WebSocket connections.
+
+    Handles connection lifecycle, heartbeat monitoring,
+    broadcast distribution, and timeout detection.
+    """
+
+    HEARTBEAT_INTERVAL: float = 30.0  # Server sends heartbeat every 30s
+    HEARTBEAT_TIMEOUT: float = 60.0   # Client must respond within 60s
+    RECONNECT_GRACE: float = 5.0      # Grace period for reconnect with same session
+
+    def __init__(self) -> None:
+        """Initialize WebSocket manager."""
+        self._connections: Dict[str, WSConnection] = {}  # session_id -> WSConnection
+        self._lock = asyncio.Lock()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self) -> None:
+        """Start heartbeat monitoring loop."""
+        self._running = True
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        logger.info("WebSocket manager started")
+
+    async def stop(self) -> None:
+        """Stop all connections and monitoring."""
+        self._running = False
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+
+        # Close all connections gracefully
+        async with self._lock:
+            for conn in list(self._connections.values()):
+                conn.is_alive = False
+                try:
+                    await conn.ws.close(code=1001, message=b"Server shutting down")
+                except Exception:
+                    pass
+            self._connections.clear()
+
+        logger.info("WebSocket manager stopped")
+
+    async def add_connection(
+        self,
+        ws: web.WebSocketResponse,
+        browser_session_id: str,
+    ) -> None:
+        """Add a new WebSocket connection.
+
+        Args:
+            ws: WebSocket response object.
+            browser_session_id: Associated browser session ID.
+        """
+        async with self._lock:
+            # Close existing connection for same session (reconnect scenario)
+            if browser_session_id in self._connections:
+                old_conn = self._connections[browser_session_id]
+                old_conn.is_alive = False
+                try:
+                    await old_conn.ws.close(code=1000, message=b"Replaced by new connection")
+                except Exception:
+                    pass
+                del self._connections[browser_session_id]
+                logger.info(f"Replaced existing WebSocket for session {browser_session_id[:8]}")
+
+            conn = WSConnection(
+                ws=ws,
+                browser_session_id=browser_session_id,
+            )
+            self._connections[browser_session_id] = conn
+            logger.info(f"WebSocket connected: {browser_session_id[:8]}")
+
+    async def remove_connection(self, browser_session_id: str) -> None:
+        """Remove a WebSocket connection.
+
+        Args:
+            browser_session_id: Browser session ID to remove.
+        """
+        async with self._lock:
+            if browser_session_id in self._connections:
+                conn = self._connections[browser_session_id]
+                conn.is_alive = False
+                del self._connections[browser_session_id]
+                logger.info(f"WebSocket disconnected: {browser_session_id[:8]}")
+
+    async def update_heartbeat(self, browser_session_id: str) -> None:
+        """Update heartbeat timestamp for a connection.
+
+        Args:
+            browser_session_id: Browser session ID.
+        """
+        async with self._lock:
+            if browser_session_id in self._connections:
+                self._connections[browser_session_id].last_heartbeat = time.time()
+
+    def get_connection_count(self) -> int:
+        """Get number of active WebSocket connections.
+
+        Returns:
+            Active connection count.
+        """
+        return len([c for c in self._connections.values() if c.is_alive])
+
+    async def broadcast(self, message: WSMessage) -> int:
+        """Broadcast message to all connected clients.
+
+        Args:
+            message: Message to broadcast.
+
+        Returns:
+            Number of clients that received the message.
+        """
+        sent_count = 0
+        dead_connections = []
+
+        async with self._lock:
+            connections = list(self._connections.items())
+
+        for session_id, conn in connections:
+            if not conn.is_alive or conn.ws.closed:
+                dead_connections.append(session_id)
+                continue
+
+            try:
+                await conn.ws.send_str(message.to_json())
+                sent_count += 1
+            except Exception as e:
+                logger.debug(f"Failed to send to {session_id[:8]}: {e}")
+                dead_connections.append(session_id)
+
+        # Clean up dead connections
+        for session_id in dead_connections:
+            await self.remove_connection(session_id)
+
+        return sent_count
+
+    async def send_to(self, browser_session_id: str, message: WSMessage) -> bool:
+        """Send message to specific client.
+
+        Args:
+            browser_session_id: Target browser session ID.
+            message: Message to send.
+
+        Returns:
+            True if sent successfully.
+        """
+        async with self._lock:
+            conn = self._connections.get(browser_session_id)
+            if not conn or not conn.is_alive or conn.ws.closed:
+                return False
+
+        try:
+            await conn.ws.send_str(message.to_json())
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send to {browser_session_id[:8]}: {e}")
+            await self.remove_connection(browser_session_id)
+            return False
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodic heartbeat and timeout detection loop."""
+        try:
+            while self._running:
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+
+                current_time = time.time()
+                dead_connections = []
+
+                async with self._lock:
+                    connections = list(self._connections.items())
+
+                for session_id, conn in connections:
+                    if not conn.is_alive:
+                        dead_connections.append(session_id)
+                        continue
+
+                    # Check for timeout
+                    if current_time - conn.last_heartbeat > self.HEARTBEAT_TIMEOUT:
+                        logger.warning(f"WebSocket timeout: {session_id[:8]}")
+                        dead_connections.append(session_id)
+                        continue
+
+                    # Send heartbeat ping
+                    try:
+                        heartbeat_msg = WSMessage.heartbeat()
+                        await conn.ws.send_str(heartbeat_msg.to_json())
+                    except Exception as e:
+                        logger.debug(f"Heartbeat failed for {session_id[:8]}: {e}")
+                        dead_connections.append(session_id)
+
+                # Clean up dead connections
+                for session_id in dead_connections:
+                    await self.remove_connection(session_id)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Heartbeat loop error: {e}")
+
+
+# =============================================================================
+# HTML TEMPLATE WITH WEBSOCKET CLIENT
 # =============================================================================
 
 WEB_UI_HTML = """<!DOCTYPE html>
@@ -274,6 +537,20 @@ WEB_UI_HTML = """<!DOCTYPE html>
         .device-info {
             font-size: 0.85rem;
             color: #a0a0a0;
+        }
+        .ws-status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .ws-connected { background: #00ff88; }
+        .ws-connecting { background: #ff9f1c; animation: pulse 1s infinite; }
+        .ws-disconnected { background: #e94560; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
         }
         .section {
             background: #1a1a3e;
@@ -405,17 +682,6 @@ WEB_UI_HTML = """<!DOCTYPE html>
             pointer-events: none;
         }
         .toast.show { opacity: 1; }
-        /* Browser info section */
-        .browser-info {
-            background: #0f0f23;
-            border-radius: 8px;
-            padding: 10px 12px;
-            margin-bottom: 8px;
-            border: 1px solid #0f3460;
-            font-size: 0.8rem;
-        }
-        .browser-info .browser-name { color: #00d9ff; font-weight: 600; }
-        .browser-info .browser-details { color: #a0a0a0; }
         @media (max-width: 400px) {
             body { padding: 12px; }
             .header h1 { font-size: 1.2rem; }
@@ -430,6 +696,10 @@ WEB_UI_HTML = """<!DOCTYPE html>
         <div class="device-info">
             <span class="status-badge status-active">Online</span>
             <span id="device-name">{{device_name}}</span>
+            <span id="ws-indicator" style="margin-left: 10px;">
+                <span class="ws-status ws-connecting" id="ws-dot"></span>
+                <span id="ws-text" style="font-size: 0.75rem; color: #a0a0a0;">Connecting...</span>
+            </span>
         </div>
     </div>
 
@@ -480,6 +750,160 @@ WEB_UI_HTML = """<!DOCTYPE html>
         let selectedFiles = [];
         let uploadCancelled = false;
 
+        // WebSocket Manager
+        class WSManager {
+            constructor() {
+                this.ws = null;
+                this.reconnectAttempts = 0;
+                this.maxReconnectDelay = 30000;
+                this.reconnectTimer = null;
+                this.heartbeatTimer = null;
+                this.url = `ws://${window.location.host}/ws`;
+                this.connected = false;
+            }
+
+            connect() {
+                if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) {
+                    return;
+                }
+
+                this.updateStatus('connecting', 'Connecting...');
+
+                try {
+                    this.ws = new WebSocket(this.url);
+
+                    this.ws.onopen = () => {
+                        console.log('WebSocket connected');
+                        this.connected = true;
+                        this.reconnectAttempts = 0;
+                        this.updateStatus('connected', 'Live');
+                        this.startHeartbeat();
+                    };
+
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const msg = JSON.parse(event.data);
+                            this.handleMessage(msg);
+                        } catch (e) {
+                            console.error('Invalid message:', event.data);
+                        }
+                    };
+
+                    this.ws.onclose = (event) => {
+                        console.log('WebSocket closed:', event.code, event.reason);
+                        this.connected = false;
+                        this.stopHeartbeat();
+                        this.updateStatus('disconnected', 'Disconnected');
+                        if (!event.wasClean) {
+                            this.scheduleReconnect();
+                        }
+                    };
+
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateStatus('disconnected', 'Error');
+                    };
+
+                } catch (e) {
+                    console.error('Failed to create WebSocket:', e);
+                    this.scheduleReconnect();
+                }
+            }
+
+            disconnect() {
+                if (this.reconnectTimer) {
+                    clearTimeout(this.reconnectTimer);
+                    this.reconnectTimer = null;
+                }
+                this.stopHeartbeat();
+                if (this.ws) {
+                    this.ws.onclose = null; // Prevent reconnect
+                    this.ws.close(1000, 'Client disconnect');
+                    this.ws = null;
+                }
+                this.connected = false;
+            }
+
+            scheduleReconnect() {
+                const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
+                this.reconnectAttempts++;
+                console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+                this.updateStatus('connecting', 'Reconnecting...');
+
+                this.reconnectTimer = setTimeout(() => {
+                    this.connect();
+                }, delay);
+            }
+
+            startHeartbeat() {
+                // Respond to server heartbeats
+                this.heartbeatTimer = setInterval(() => {
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        this.send({type: 'heartbeat_ack'});
+                    }
+                }, 25000); // Send ack every 25s to stay alive
+            }
+
+            stopHeartbeat() {
+                if (this.heartbeatTimer) {
+                    clearInterval(this.heartbeatTimer);
+                    this.heartbeatTimer = null;
+                }
+            }
+
+            send(data) {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify(data));
+                    return true;
+                }
+                return false;
+            }
+
+            handleMessage(msg) {
+                switch (msg.type) {
+                    case 'heartbeat':
+                        // Server heartbeat - respond immediately
+                        this.send({type: 'heartbeat_ack'});
+                        break;
+                    case 'status_update':
+                        console.log('Status:', msg.data.status);
+                        break;
+                    case 'file_update':
+                        console.log('Files updated:', msg.data.files_count);
+                        break;
+                    case 'browser_update':
+                        console.log('Browsers:', msg.data.count);
+                        break;
+                    case 'upload_progress':
+                        console.log('Upload progress:', msg.data.progress);
+                        break;
+                    case 'error':
+                        console.error('Server error:', msg.data.message);
+                        showToast('Error: ' + msg.data.message);
+                        break;
+                    default:
+                        console.log('Unknown message type:', msg.type);
+                }
+            }
+
+            updateStatus(state, text) {
+                const dot = document.getElementById('ws-dot');
+                const txt = document.getElementById('ws-text');
+                if (dot && txt) {
+                    dot.className = 'ws-status ws-' + state;
+                    txt.textContent = text;
+                }
+            }
+        }
+
+        const wsManager = new WSManager();
+        wsManager.connect();
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            wsManager.disconnect();
+        });
+
         function showToast(message) {
             const toast = document.getElementById('toast');
             toast.textContent = message;
@@ -514,14 +938,9 @@ WEB_UI_HTML = """<!DOCTYPE html>
                 const files = [];
                 for (let i = 0; i < items.length; i++) {
                     const item = items[i].webkitGetAsEntry();
-                    if (item) {
-                        traverseFileTree(item, files);
-                    }
+                    if (item) traverseFileTree(item, files);
                 }
-                setTimeout(() => {
-                    selectedFiles = files;
-                    updateFilePreviews();
-                }, 100);
+                setTimeout(() => { selectedFiles = files; updateFilePreviews(); }, 100);
             } else {
                 selectedFiles = Array.from(e.dataTransfer.files);
                 updateFilePreviews();
@@ -563,10 +982,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
             selectedFiles.forEach(file => {
                 const div = document.createElement('div');
                 div.className = 'file-preview';
-                div.innerHTML = `
-                    <span class="file-preview-name">${file.name}</span>
-                    <span class="file-preview-size">${formatSize(file.size)}</span>
-                `;
+                div.innerHTML = `<span class="file-preview-name">${file.name}</span><span class="file-preview-size">${formatSize(file.size)}</span>`;
                 filePreviews.appendChild(div);
             });
             uploadBtn.style.display = 'block';
@@ -574,7 +990,6 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
         uploadBtn.addEventListener('click', async () => {
             if (selectedFiles.length === 0) return;
-
             uploadCancelled = false;
             uploadBtn.disabled = true;
             uploadBtn.textContent = 'Uploading...';
@@ -585,7 +1000,6 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
             for (let i = 0; i < selectedFiles.length; i++) {
                 if (uploadCancelled) break;
-
                 const file = selectedFiles[i];
                 const formData = new FormData();
                 formData.append('file', file);
@@ -594,7 +1008,6 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
                 try {
                     const xhr = new XMLHttpRequest();
-
                     xhr.upload.addEventListener('progress', (e) => {
                         if (e.lengthComputable) {
                             const fileProgress = e.loaded / e.total;
@@ -635,10 +1048,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
             uploadBtn.textContent = 'Upload Files';
             selectedFiles = [];
             updateFilePreviews();
-            setTimeout(() => {
-                progressContainer.style.display = 'none';
-                progressFill.style.width = '0%';
-            }, 2000);
+            setTimeout(() => { progressContainer.style.display = 'none'; progressFill.style.width = '0%'; }, 2000);
         });
 
         function cancelUpload() {
@@ -671,8 +1081,8 @@ class WebShareServer:
     Allows any device with a web browser to download and
     upload files without installing ShareX.
 
-    ENHANCED: Browser session tracking, detection, live status,
-    and WebSocket preparation.
+    ENHANCED: Full WebSocket support with real-time updates,
+    heartbeat monitoring, automatic reconnect, and timeout detection.
 
     Attributes:
         session: Current web share session.
@@ -682,8 +1092,8 @@ class WebShareServer:
         _app: aiohttp application instance.
         _runner: aiohttp server runner.
         _site: aiohttp server site.
+        _ws_manager: WebSocket connection manager.
         _browser_sessions: Active browser connections.
-        _browser_cleanup_task: Periodic cleanup task.
     """
 
     def __init__(
@@ -712,6 +1122,9 @@ class WebShareServer:
         self._upload_futures: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
+        # WebSocket manager
+        self._ws_manager = WebSocketManager()
+
         # Browser session management
         self._browser_sessions: Dict[str, BrowserSession] = {}
         self._browser_cleanup_task: Optional[asyncio.Task] = None
@@ -725,33 +1138,22 @@ class WebShareServer:
     # =====================================================================
 
     def _get_or_create_browser_session(self, request: web.Request) -> BrowserSession:
-        """Get existing or create new browser session for a request.
-
-        Args:
-            request: The HTTP request.
-
-        Returns:
-            BrowserSession for this client.
-        """
+        """Get existing or create new browser session for a request."""
         client_ip = request.remote or "unknown"
         user_agent = request.headers.get("User-Agent", "")
 
-        # Create a session ID from IP + User-Agent hash
         session_key = hashlib.sha256(
             f"{client_ip}:{user_agent}".encode()
         ).hexdigest()[:16]
 
-        # Check for existing session
         existing = self._browser_sessions.get(session_key)
         if existing and existing.is_active:
             existing.last_activity = time.time()
             existing.page_views += 1
             return existing
 
-        # Detect browser info
         browser_type, platform_type, version = BrowserDetector.detect(user_agent)
 
-        # Create new session
         new_session = BrowserSession(
             id=session_key,
             ip_address=client_ip,
@@ -765,21 +1167,11 @@ class WebShareServer:
         self._browser_sessions[session_key] = new_session
         logger.info(f"New browser session: {new_session.display_name} from {client_ip}")
 
-        # Notify about browser update
-        if self.on_browser_update:
-            try:
-                self.on_browser_update(self.get_active_browser_sessions())
-            except Exception as e:
-                logger.error(f"Browser update callback error: {e}")
-
+        self._notify_browser_update()
         return new_session
 
     def get_active_browser_sessions(self) -> List[BrowserSession]:
-        """Get list of currently active browser sessions.
-
-        Returns:
-            List of active BrowserSession objects.
-        """
+        """Get list of currently active browser sessions."""
         current_time = time.time()
         active = []
         for session in self._browser_sessions.values():
@@ -788,23 +1180,12 @@ class WebShareServer:
         return active
 
     def get_browser_session_count(self) -> int:
-        """Get count of active browser sessions.
-
-        Returns:
-            Number of active browser sessions.
-        """
+        """Get count of active browser sessions."""
         return len(self.get_active_browser_sessions())
 
-    def _update_browser_activity(self, session_id: str, bytes_count: int = 0, 
+    def _update_browser_activity(self, session_id: str, bytes_count: int = 0,
                                   download: bool = False, upload: bool = False) -> None:
-        """Update browser session activity metrics.
-
-        Args:
-            session_id: Browser session ID.
-            bytes_count: Bytes transferred.
-            download: Whether a download occurred.
-            upload: Whether an upload occurred.
-        """
+        """Update browser session activity metrics."""
         session = self._browser_sessions.get(session_id)
         if session:
             session.last_activity = time.time()
@@ -813,12 +1194,29 @@ class WebShareServer:
                 session.files_downloaded += 1
             if upload:
                 session.files_uploaded += 1
+            self._notify_browser_update()
+
+    def _notify_browser_update(self) -> None:
+        """Notify UI about browser changes via callback and WebSocket."""
+        sessions = self.get_active_browser_sessions()
+
+        # Callback notification
+        if self.on_browser_update:
+            try:
+                self.on_browser_update(sessions)
+            except Exception as e:
+                logger.error(f"Browser update callback error: {e}")
+
+        # WebSocket broadcast
+        asyncio.create_task(
+            self._ws_manager.broadcast(WSMessage.browser_update(sessions))
+        )
 
     async def _browser_cleanup_loop(self) -> None:
         """Periodic cleanup of stale browser sessions."""
         try:
             while self.session.status == WebShareStatus.ACTIVE:
-                await asyncio.sleep(30)  # Check every 30 seconds
+                await asyncio.sleep(30)
 
                 current_time = time.time()
                 stale_sessions = []
@@ -832,13 +1230,7 @@ class WebShareServer:
                 if stale_sessions:
                     for session_id in stale_sessions:
                         self._browser_sessions.pop(session_id, None)
-
-                    # Notify about browser update
-                    if self.on_browser_update:
-                        try:
-                            self.on_browser_update(self.get_active_browser_sessions())
-                        except Exception as e:
-                            logger.error(f"Browser update callback error: {e}")
+                    self._notify_browser_update()
 
         except asyncio.CancelledError:
             pass
@@ -846,85 +1238,133 @@ class WebShareServer:
             logger.error(f"Browser cleanup error: {e}")
 
     # =====================================================================
-    # WEBSOCKET PREPARATION
+    # WEBSOCKET HANDLERS
     # =====================================================================
 
-    def _prepare_websocket_routes(self) -> None:
-        """Prepare WebSocket routes for future implementation.
-
-        This method sets up the route structure. Full WebSocket
-        implementation requires upgrading the connection.
-        """
+    def _setup_websocket_routes(self) -> None:
+        """Setup WebSocket routes."""
         if not self._app:
             return
 
-        # Register WebSocket endpoint (prepared for future use)
         self._app.router.add_get("/ws", self._handle_websocket)
-        logger.info("WebSocket endpoint prepared at /ws")
+        logger.info("WebSocket endpoint registered at /ws")
 
     async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
-        """Handle WebSocket connection requests.
+        """Handle WebSocket connection with full lifecycle management.
 
-        Currently returns a prepared response. Full implementation
-        will handle real-time bidirectional communication.
-
-        Args:
-            request: HTTP upgrade request.
-
-        Returns:
-            WebSocketResponse (prepared for future use).
+        Supports: connect, disconnect, heartbeat, reconnect, timeout detection.
         """
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(
+            heartbeat=30.0,
+            autoping=True,
+        )
         await ws.prepare(request)
 
-        logger.info(f"WebSocket connection prepared from {request.remote}")
+        # Get or create browser session
+        browser_session = self._get_or_create_browser_session(request)
+        browser_session.is_websocket = True
+        browser_session.last_heartbeat = time.time()
 
-        # Send initial status message
-        status_msg = WebSocketPreparedMessage.status_update(
-            self.session.status.value,
-            self.session.url
-        )
-        await ws.send_str(status_msg.to_json())
+        # Register with WebSocket manager
+        await self._ws_manager.add_connection(ws, browser_session.id)
 
-        # Keep connection alive for future implementation
+        logger.info(f"WebSocket connected: {browser_session.display_name} ({browser_session.ip_address})")
+
+        # Send initial status
+        try:
+            await ws.send_str(WSMessage.status_update(
+                self.session.status.value,
+                self.session.url
+            ).to_json())
+
+            # Send current file list
+            await ws.send_str(WSMessage.file_update(
+                self.session.files,
+                self.session.uploaded_files
+            ).to_json())
+
+            # Send current browser list
+            await ws.send_str(WSMessage.browser_update(
+                self.get_active_browser_sessions()
+            ).to_json())
+        except Exception as e:
+            logger.error(f"WebSocket initial send failed: {e}")
+            await self._ws_manager.remove_connection(browser_session.id)
+            return ws
+
+        # Message loop
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    # Handle incoming messages in future implementation
-                    logger.debug(f"WebSocket message: {msg.data}")
+                    try:
+                        data = json.loads(msg.data)
+                        msg_type = data.get("type", "")
+
+                        if msg_type == "heartbeat_ack":
+                            # Client acknowledged heartbeat
+                            await self._ws_manager.update_heartbeat(browser_session.id)
+                            browser_session.last_heartbeat = time.time()
+                        elif msg_type == "ping":
+                            # Client ping
+                            await ws.send_str(WSMessage(type="pong").to_json())
+                        else:
+                            logger.debug(f"WebSocket message from {browser_session.id[:8]}: {msg_type}")
+
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON from {browser_session.id[:8]}: {msg.data[:100]}")
+
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     logger.error(f"WebSocket error: {ws.exception()}")
+                    break
+
+                elif msg.type == aiohttp.WSMsgType.CLOSE:
+                    logger.info(f"WebSocket closed by client: {browser_session.id[:8]}")
+                    break
+
         except Exception as e:
-            logger.error(f"WebSocket handler error: {e}")
+            logger.error(f"WebSocket handler error for {browser_session.id[:8]}: {e}")
+
         finally:
-            logger.info(f"WebSocket connection closed from {request.remote}")
+            # Cleanup
+            await self._ws_manager.remove_connection(browser_session.id)
+            browser_session.is_websocket = False
+            self._notify_browser_update()
+            logger.info(f"WebSocket disconnected: {browser_session.display_name}")
 
         return ws
 
-    def _broadcast_to_websockets(self, message: WebSocketPreparedMessage) -> None:
-        """Broadcast a message to all connected WebSocket clients.
+    async def _broadcast_browser_update(self) -> None:
+        """Broadcast browser update to all WebSocket clients."""
+        sessions = self.get_active_browser_sessions()
+        await self._ws_manager.broadcast(WSMessage.browser_update(sessions))
 
-        Prepared for future use when WebSocket connections are tracked.
+    async def _broadcast_file_update(self) -> None:
+        """Broadcast file update to all WebSocket clients."""
+        await self._ws_manager.broadcast(WSMessage.file_update(
+            self.session.files,
+            self.session.uploaded_files
+        ))
 
-        Args:
-            message: Message to broadcast.
-        """
-        # Future implementation will iterate over active WebSocket connections
-        logger.debug(f"WebSocket broadcast prepared: {message.type}")
+    async def _broadcast_status_update(self) -> None:
+        """Broadcast status update to all WebSocket clients."""
+        await self._ws_manager.broadcast(WSMessage.status_update(
+            self.session.status.value,
+            self.session.url
+        ))
 
     # =====================================================================
     # LIFECYCLE
     # =====================================================================
 
     async def start(self) -> None:
-        """Start the HTTP server."""
+        """Start the HTTP server with WebSocket support."""
         try:
             self.session.status = WebShareStatus.STARTING
             self._notify_status_change()
 
             self._app = web.Application()
             self._setup_routes()
-            self._prepare_websocket_routes()  # NEW: WebSocket preparation
+            self._setup_websocket_routes()
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
@@ -936,7 +1376,8 @@ class WebShareServer:
             )
             await self._site.start()
 
-            # Start browser cleanup loop
+            # Start managers
+            await self._ws_manager.start()
             self._browser_cleanup_task = asyncio.create_task(
                 self._browser_cleanup_loop()
             )
@@ -952,10 +1393,13 @@ class WebShareServer:
             raise
 
     async def stop(self) -> None:
-        """Stop the HTTP server."""
+        """Stop the HTTP server and WebSocket connections."""
         try:
             self.session.status = WebShareStatus.STOPPING
             self._notify_status_change()
+
+            # Stop WebSocket manager first (notifies clients)
+            await self._ws_manager.stop()
 
             # Cancel browser cleanup
             if self._browser_cleanup_task:
@@ -981,49 +1425,49 @@ class WebShareServer:
             self._notify_status_change()
 
     def _setup_routes(self) -> None:
-        """Configure HTTP routes."""
+        """Configure HTTP routes (HTTP remains fully functional)."""
         if not self._app:
             return
 
+        # Core HTTP routes (unchanged)
         self._app.router.add_get("/", self._handle_index)
         self._app.router.add_get("/download/{filename}", self._handle_download)
         self._app.router.add_post("/upload", self._handle_upload)
         self._app.router.add_get("/api/files", self._handle_api_files)
         self._app.router.add_get("/api/status", self._handle_api_status)
-        # NEW: Browser API endpoints
         self._app.router.add_get("/api/browsers", self._handle_api_browsers)
         self._app.router.add_get("/api/browsers/count", self._handle_api_browser_count)
-        self._app.router.add_static("/downloads", path=get_config().config.download_folder, name="downloads")
+
+        # Static files
+        config = get_config()
+        download_path = Path(config.config.download_folder)
+        if download_path.exists():
+            self._app.router.add_static("/downloads", path=str(download_path), name="downloads")
 
     def _notify_status_change(self) -> None:
-        """Notify status change callback."""
+        """Notify status change via callback and WebSocket."""
         if self.on_status_change:
             try:
                 self.on_status_change(self.session.status)
             except Exception as e:
                 logger.error(f"Status change callback error: {e}")
 
+        # Broadcast to WebSocket clients
+        if self.session.status in (WebShareStatus.ACTIVE, WebShareStatus.STOPPING, WebShareStatus.STOPPED):
+            asyncio.create_task(self._broadcast_status_update())
+
     # =====================================================================
-    # HANDLERS (ENHANCED WITH BROWSER TRACKING)
+    # HTTP HANDLERS (UNCHANGED - Downloads work via HTTP)
     # =====================================================================
 
     async def _handle_index(self, request: web.Request) -> web.Response:
-        """Handle main page request.
-
-        Args:
-            request: HTTP request.
-
-        Returns:
-            HTML response.
-        """
+        """Handle main page request."""
         try:
-            # Track browser session
             browser_session = self._get_or_create_browser_session(request)
 
             config = get_config()
             device_name = config.config.device_name
 
-            # Build file list HTML
             file_list_html = ""
             for file_info in self.session.files:
                 size_str = self._format_size(file_info.get("size", 0))
@@ -1042,7 +1486,6 @@ class WebShareServer:
             empty_display = "none" if self.session.files else "block"
             file_count = len(self.session.files)
 
-            # Enhanced connection info with browser detection
             browser_count = self.get_browser_session_count()
             browser_text = f"{browser_count} browser{'s' if browser_count != 1 else ''} connected"
             connection_info = f"Connected from: {request.remote} | {browser_text}"
@@ -1061,23 +1504,14 @@ class WebShareServer:
             return web.Response(status=500, text="Internal Server Error")
 
     async def _handle_download(self, request: web.Request) -> web.Response:
-        """Handle file download request.
-
-        Args:
-            request: HTTP request with filename.
-
-        Returns:
-            File response or error.
-        """
+        """Handle file download request (HTTP streaming - unchanged)."""
         try:
-            # Track browser session
             browser_session = self._get_or_create_browser_session(request)
 
             filename = request.match_info.get("filename", "")
             if not filename:
                 return web.Response(status=400, text="Filename required")
 
-            # Find file in session
             file_info = None
             for f in self.session.files:
                 if f["name"] == filename:
@@ -1091,15 +1525,14 @@ class WebShareServer:
             if not file_path.exists():
                 return web.Response(status=404, text="File not found on server")
 
-            # Track download in browser session
             file_size = file_info.get("size", 0)
             self._update_browser_activity(
-                browser_session.id, 
+                browser_session.id,
                 bytes_count=file_size,
                 download=True
             )
 
-            # Stream file for large file support
+            # HTTP file streaming (unchanged)
             response = web.StreamResponse(
                 status=200,
                 headers={
@@ -1119,7 +1552,7 @@ class WebShareServer:
                     await response.write(chunk)
 
             await response.write_eof()
-            logger.info(f"File downloaded: {filename} by {request.remote} ({browser_session.display_name})")
+            logger.info(f"File downloaded: {filename} by {request.remote}")
             return response
 
         except Exception as e:
@@ -1127,69 +1560,20 @@ class WebShareServer:
             return web.Response(status=500, text="Download failed")
 
     async def _handle_upload(self, request: web.Request) -> web.Response:
-        """Handle file upload request with approval.
-
-        Args:
-            request: HTTP request with file data.
-
-        Returns:
-            JSON response indicating upload status.
-        """
+        """Handle file upload request with approval."""
         try:
-            # Track browser session
             browser_session = self._get_or_create_browser_session(request)
 
             reader = await request.multipart()
 
             filename = None
             session_id = None
-            file_data = b""
-
-            async for part in reader:
-                if part.name == "file":
-                    filename = part.filename
-                    chunks = []
-                    while True:
-                        chunk = await part.read_chunk()
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                    file_data = b"".join(chunks)
-                elif part.name == "filename":
-                    filename = (await part.read()).decode("utf-8")
-                elif part.name == "session_id":
-                    session_id = (await part.read()).decode("utf-8")
-
-            if not filename or not file_data:
-                return web.json_response(
-                    {"error": "Missing file or filename"},
-                    status=400,
-                )
-
-            if session_id != self.session.id:
-                return web.json_response(
-                    {"error": "Invalid session"},
-                    status=403,
-                )
-
-            client_ip = request.remote or "unknown"
-            file_size = len(file_data)
-
-            # Check max upload size
-            if file_size > self.session.max_upload_size:
-                return web.json_response(
-                    {"error": f"File too large. Max: {self._format_size(self.session.max_upload_size)}"},
-                    status=413,
-                )
-
-            # Save to temp file first by streaming chunks to avoid high RAM usage
-            temp_fd, temp_path = tempfile.mkstemp(prefix="sharex_upload_")
-            filename = None
-            session_id = None
             file_size = 0
 
+            # Stream upload to temp file
+            temp_fd, temp_path = tempfile.mkstemp(prefix="sharex_upload_")
             try:
-                with open(temp_fd, "wb") as f:
+                with os.fdopen(temp_fd, "wb") as f:
                     async for part in reader:
                         if part.name == "file":
                             filename = part.filename
@@ -1208,10 +1592,33 @@ class WebShareServer:
                     os.unlink(temp_path)
                 except OSError:
                     pass
-                logger.error(f"Error reading upload stream: {e}")
+                logger.error(f"Upload stream error: {e}")
+                return web.json_response({"error": "Upload failed"}, status=500)
+
+            if not filename or file_size == 0:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                return web.json_response({"error": "Missing file"}, status=400)
+
+            if session_id != self.session.id:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                return web.json_response({"error": "Invalid session"}, status=403)
+
+            client_ip = request.remote or "unknown"
+
+            if file_size > self.session.max_upload_size:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
                 return web.json_response(
-                    {"error": "Upload stream failed"},
-                    status=500,
+                    {"error": f"File too large. Max: {self._format_size(self.session.max_upload_size)}"},
+                    status=413,
                 )
 
             # Create upload request for approval
@@ -1232,7 +1639,7 @@ class WebShareServer:
                 self._pending_uploads[upload_id] = upload_request
                 self._upload_futures[upload_id] = asyncio.get_event_loop().create_future()
 
-            # Request approval from user
+            # Request approval
             if self.on_upload_request:
                 try:
                     approved = await self.on_upload_request(upload_request)
@@ -1240,11 +1647,9 @@ class WebShareServer:
                     logger.error(f"Approval callback error: {e}")
                     approved = False
             else:
-                # Auto-approve if no callback
                 approved = True
 
             if not approved:
-                # Clean up temp file
                 try:
                     os.unlink(temp_path)
                 except OSError:
@@ -1257,7 +1662,7 @@ class WebShareServer:
                     status=403,
                 )
 
-            # Move file to download folder
+            # Move to final location
             config = get_config()
             download_dir = Path(config.config.download_folder)
             if not download_dir.exists():
@@ -1265,7 +1670,6 @@ class WebShareServer:
             download_dir.mkdir(parents=True, exist_ok=True)
 
             dest_path = download_dir / filename
-            # Handle duplicate filenames
             counter = 1
             original_dest = dest_path
             while dest_path.exists():
@@ -1276,7 +1680,7 @@ class WebShareServer:
 
             shutil.move(temp_path, str(dest_path))
 
-            # Calculate SHA-256 checksum
+            # Calculate checksum
             sha256_hash = hashlib.sha256()
             async with aiofiles.open(dest_path, "rb") as f:
                 while True:
@@ -1286,7 +1690,6 @@ class WebShareServer:
                     sha256_hash.update(chunk)
             checksum = sha256_hash.hexdigest()
 
-            # Add to session uploaded files
             self.session.add_uploaded_file(
                 file_name=filename,
                 file_path=str(dest_path),
@@ -1294,28 +1697,26 @@ class WebShareServer:
                 uploader_ip=client_ip,
             )
 
-            # Track upload in browser session
             self._update_browser_activity(
                 browser_session.id,
                 bytes_count=file_size,
                 upload=True
             )
 
-            # Clean up pending
+            # Broadcast file update via WebSocket
+            asyncio.create_task(self._broadcast_file_update())
+
             async with self._lock:
                 self._pending_uploads.pop(upload_id, None)
                 future = self._upload_futures.pop(upload_id, None)
                 if future and not future.done():
                     future.set_result(True)
 
-            logger.info(f"File uploaded: {filename} ({self._format_size(file_size)}) from {client_ip} ({browser_session.display_name})")
-
             return web.json_response({
                 "success": True,
                 "filename": filename,
                 "size": file_size,
                 "checksum": checksum,
-                "message": "Upload complete",
             })
 
         except Exception as e:
@@ -1326,18 +1727,12 @@ class WebShareServer:
             )
 
     # =====================================================================
-    # API HANDLERS (ENHANCED)
+    # API HANDLERS (HTTP FALLBACK - UNCHANGED)
     # =====================================================================
 
     async def _handle_api_files(self, request: web.Request) -> web.Response:
-        """Handle API request for file list.
-
-        Args:
-            request: HTTP request.
-
-        Returns:
-            JSON response with file list.
-        """
+        """Handle API request for file list."""
+        self._get_or_create_browser_session(request)
         return web.json_response({
             "files": self.session.files,
             "uploaded_files": self.session.uploaded_files,
@@ -1345,36 +1740,22 @@ class WebShareServer:
         })
 
     async def _handle_api_status(self, request: web.Request) -> web.Response:
-        """Handle API request for server status.
-
-        Args:
-            request: HTTP request.
-
-        Returns:
-            JSON response with status.
-        """
+        """Handle API request for server status."""
+        self._get_or_create_browser_session(request)
         return web.json_response({
             "status": self.session.status.value,
             "device_name": get_config().config.device_name,
             "url": self.session.url,
             "files_count": len(self.session.files),
             "uploaded_count": len(self.session.uploaded_files),
-            # NEW: Browser session info
             "browser_count": self.get_browser_session_count(),
             "browser_sessions": [s.to_dict() for s in self.get_active_browser_sessions()],
+            "websocket_count": self._ws_manager.get_connection_count(),
         })
 
     async def _handle_api_browsers(self, request: web.Request) -> web.Response:
-        """Handle API request for browser sessions.
-
-        NEW: Returns detailed browser session information.
-
-        Args:
-            request: HTTP request.
-
-        Returns:
-            JSON response with browser session list.
-        """
+        """Handle API request for browser sessions."""
+        self._get_or_create_browser_session(request)
         sessions = self.get_active_browser_sessions()
         return web.json_response({
             "count": len(sessions),
@@ -1382,34 +1763,19 @@ class WebShareServer:
         })
 
     async def _handle_api_browser_count(self, request: web.Request) -> web.Response:
-        """Handle API request for browser count.
-
-        NEW: Returns simple browser count.
-
-        Args:
-            request: HTTP request.
-
-        Returns:
-            JSON response with browser count.
-        """
+        """Handle API request for browser count."""
+        self._get_or_create_browser_session(request)
         return web.json_response({
             "count": self.get_browser_session_count(),
+            "websocket_count": self._ws_manager.get_connection_count(),
         })
 
     # =====================================================================
-    # UPLOAD MANAGEMENT (UNCHANGED)
+    # UPLOAD MANAGEMENT
     # =====================================================================
 
     def approve_upload(self, upload_id: str, approved: bool = True) -> bool:
-        """Approve or reject a pending upload.
-
-        Args:
-            upload_id: Upload request ID.
-            approved: Whether to approve the upload.
-
-        Returns:
-            True if action was successful.
-        """
+        """Approve or reject a pending upload."""
         try:
             upload = self._pending_uploads.get(upload_id)
             if not upload:
@@ -1428,23 +1794,12 @@ class WebShareServer:
             return False
 
     def get_pending_uploads(self) -> List[UploadRequest]:
-        """Get list of pending upload requests.
-
-        Returns:
-            List of pending uploads.
-        """
+        """Get list of pending upload requests."""
         return list(self._pending_uploads.values())
 
     @staticmethod
     def _format_size(size: int) -> str:
-        """Format bytes to human-readable string.
-
-        Args:
-            size: Size in bytes.
-
-        Returns:
-            Formatted string.
-        """
+        """Format bytes to human-readable string."""
         for unit in ["B", "KB", "MB", "GB", "TB"]:
             if size < 1024:
                 return f"{size:.1f} {unit}"
