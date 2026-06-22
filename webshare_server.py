@@ -463,6 +463,67 @@ class WebSocketManager:
             await self.remove_connection(browser_session_id)
             return False
 
+
+    async def send_to_session(self, session_id: str, message: WSMessage) -> bool:
+        """Send a message to a specific browser session.
+
+        Args:
+            session_id: Browser session ID.
+            message: Message to send.
+
+        Returns:
+            True if sent successfully.
+        """
+        async with self._lock:
+            conn = self._connections.get(session_id)
+
+        if not conn or not conn.is_alive or conn.ws.closed:
+            logger.warning(f"No active WebSocket for session: {session_id[:8]}")
+            return False
+
+        try:
+            await conn.ws.send_str(message.to_json())
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send to session {session_id[:8]}: {e}")
+            await self.remove_connection(session_id)
+            return False
+
+    async def send_to_all_except(self, exclude_session_id: str, message: WSMessage) -> int:
+        """Broadcast message to all clients except one.
+
+        Args:
+            exclude_session_id: Session to exclude.
+            message: Message to broadcast.
+
+        Returns:
+            Number of clients that received the message.
+        """
+        sent_count = 0
+        dead_connections = []
+
+        async with self._lock:
+            connections = list(self._connections.items())
+
+        for session_id, conn in connections:
+            if session_id == exclude_session_id:
+                continue
+            if not conn.is_alive or conn.ws.closed:
+                dead_connections.append(session_id)
+                continue
+
+            try:
+                await conn.ws.send_str(message.to_json())
+                sent_count += 1
+            except Exception as e:
+                logger.debug(f"Failed to send to {session_id[:8]}: {e}")
+                dead_connections.append(session_id)
+
+        for session_id in dead_connections:
+            await self.remove_connection(session_id)
+
+        return sent_count
+
     async def _heartbeat_loop(self) -> None:
         """Periodic heartbeat and timeout detection loop."""
         try:
@@ -744,13 +805,14 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
     <div class="toast" id="toast"></div>
 
-    <script>
+    
+<script>
         const deviceName = "{{device_name}}";
         const sessionId = "{{session_id}}";
         let selectedFiles = [];
         let uploadCancelled = false;
 
-        // WebSocket Manager
+        // WebSocket Manager with Auto-Download Support
         class WSManager {
             constructor() {
                 this.ws = null;
@@ -817,7 +879,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
                 }
                 this.stopHeartbeat();
                 if (this.ws) {
-                    this.ws.onclose = null; // Prevent reconnect
+                    this.ws.onclose = null;
                     this.ws.close(1000, 'Client disconnect');
                     this.ws = null;
                 }
@@ -825,23 +887,23 @@ WEB_UI_HTML = """<!DOCTYPE html>
             }
 
             scheduleReconnect() {
+                if (this.reconnectTimer) return;
                 const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
                 this.reconnectAttempts++;
                 console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-                this.updateStatus('connecting', 'Reconnecting...');
-
                 this.reconnectTimer = setTimeout(() => {
+                    this.reconnectTimer = null;
                     this.connect();
                 }, delay);
             }
 
             startHeartbeat() {
-                // Respond to server heartbeats
+                this.stopHeartbeat();
                 this.heartbeatTimer = setInterval(() => {
                     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.send({type: 'heartbeat_ack'});
+                        this.ws.send(JSON.stringify({type: 'ping'}));
                     }
-                }, 25000); // Send ack every 25s to stay alive
+                }, 30000);
             }
 
             stopHeartbeat() {
@@ -851,210 +913,198 @@ WEB_UI_HTML = """<!DOCTYPE html>
                 }
             }
 
-            send(data) {
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify(data));
-                    return true;
+            updateStatus(status, text) {
+                const indicator = document.getElementById('ws-indicator');
+                if (indicator) {
+                    indicator.className = `ws-status ws-${status}`;
+                    indicator.title = text;
                 }
-                return false;
             }
 
             handleMessage(msg) {
+                console.log('WS message:', msg.type);
                 switch (msg.type) {
-                    case 'heartbeat':
-                        // Server heartbeat - respond immediately
-                        this.send({type: 'heartbeat_ack'});
-                        break;
-                    case 'status_update':
-                        console.log('Status:', msg.data.status);
+                    case 'file_push':
+                        this.handleFilePush(msg.payload);
                         break;
                     case 'file_update':
-                        console.log('Files updated:', msg.data.files_count);
+                        updateFileList(msg.payload.files || []);
                         break;
                     case 'browser_update':
-                        console.log('Browsers:', msg.data.count);
                         break;
-                    case 'upload_progress':
-                        console.log('Upload progress:', msg.data.progress);
+                    case 'status_update':
                         break;
-                    case 'error':
-                        console.error('Server error:', msg.data.message);
-                        showToast('Error: ' + msg.data.message);
+                    case 'pong':
                         break;
                     default:
                         console.log('Unknown message type:', msg.type);
                 }
             }
 
-            updateStatus(state, text) {
-                const dot = document.getElementById('ws-dot');
-                const txt = document.getElementById('ws-text');
-                if (dot && txt) {
-                    dot.className = 'ws-status ws-' + state;
-                    txt.textContent = text;
+            handleFilePush(payload) {
+                console.log('File push received:', payload);
+                showNotification(`New file: ${payload.file_name}`, 'info');
+                if (payload.auto_download) {
+                    autoDownloadFile(payload.download_url, payload.file_name, payload.push_id);
+                }
+                refreshFileList();
+            }
+
+            send(msg) {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify(msg));
                 }
             }
         }
 
         const wsManager = new WSManager();
-        wsManager.connect();
+
+        function autoDownloadFile(url, filename, pushId) {
+            const downloadLink = document.createElement('a');
+            downloadLink.href = url;
+            downloadLink.download = filename;
+            downloadLink.style.display = 'none';
+            document.body.appendChild(downloadLink);
+            downloadLink.click();
+            document.body.removeChild(downloadLink);
+            showNotification(`Downloading: ${filename}`, 'success');
+            // Send download complete acknowledgment
+            wsManager.send({
+                type: 'download_complete',
+                push_id: pushId,
+                success: true
+            });
+        }
+
+        function showNotification(message, type) {
+            const notif = document.createElement('div');
+            notif.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                padding: 12px 20px;
+                border-radius: 8px;
+                color: white;
+                font-weight: 600;
+                z-index: 10000;
+                animation: slideIn 0.3s ease;
+                background: ${type === 'success' ? '#00ff88' : type === 'error' ? '#e94560' : '#00d9ff'};
+                color: ${type === 'success' ? '#0f0f23' : '#fff'};
+            `;
+            notif.textContent = message;
+            document.body.appendChild(notif);
+            setTimeout(() => {
+                notif.style.animation = 'slideOut 0.3s ease';
+                setTimeout(() => notif.remove(), 300);
+            }, 3000);
+        }
+
+        // File list management
+        function updateFileList(files) {
+            const fileList = document.getElementById('file-list');
+            if (!fileList) return;
+            fileList.innerHTML = '';
+            if (files.length === 0) {
+                document.getElementById('empty-files').style.display = 'block';
+                return;
+            }
+            document.getElementById('empty-files').style.display = 'none';
+            files.forEach(file => {
+                const li = document.createElement('li');
+                li.className = 'file-item';
+                li.innerHTML = `
+                    <div class="file-info">
+                        <div class="file-name">${escapeHtml(file.name)}</div>
+                        <div class="file-size">${formatSize(file.size)}</div>
+                    </div>
+                    <a href="/download/${encodeURIComponent(file.name)}" class="btn btn-primary btn-sm" download>
+                        Download
+                    </a>
+                `;
+                fileList.appendChild(li);
+            });
+        }
+
+        function refreshFileList() {
+            fetch('/api/files')
+                .then(r => r.json())
+                .then(data => updateFileList(data.files || []))
+                .catch(e => console.error('Refresh error:', e));
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        // Upload functionality
+        function handleUpload() {
+            const input = document.getElementById('upload-input');
+            const files = input.files;
+            if (!files || files.length === 0) return;
+            uploadFile(files[0]);
+        }
+
+        function uploadFile(file) {
+            uploadCancelled = false;
+            const progressDiv = document.getElementById('upload-progress');
+            const progressBar = document.getElementById('progress-bar');
+            const progressText = document.getElementById('progress-text');
+            progressDiv.style.display = 'block';
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('filename', file.name);
+            formData.append('session_id', sessionId);
+
+            const xhr = new XMLHttpRequest();
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const percent = (e.loaded / e.total) * 100;
+                    progressBar.style.width = percent + '%';
+                    progressText.textContent = `Uploading: ${percent.toFixed(1)}%`;
+                }
+            });
+
+            xhr.addEventListener('load', () => {
+                progressDiv.style.display = 'none';
+                if (xhr.status === 200) {
+                    const result = JSON.parse(xhr.responseText);
+                    showNotification(`Uploaded: ${result.filename}`, 'success');
+                    refreshFileList();
+                } else {
+                    showNotification('Upload failed', 'error');
+                }
+            });
+
+            xhr.addEventListener('error', () => {
+                progressDiv.style.display = 'none';
+                showNotification('Upload error', 'error');
+            });
+
+            xhr.open('POST', '/upload');
+            xhr.send(formData);
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            wsManager.connect();
+            refreshFileList();
+        });
 
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             wsManager.disconnect();
         });
-
-        function showToast(message) {
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.classList.add('show');
-            setTimeout(() => toast.classList.remove('show'), 3000);
-        }
-
-        const uploadArea = document.getElementById('upload-area');
-        const fileInput = document.getElementById('file-input');
-        const filePreviews = document.getElementById('file-previews');
-        const uploadBtn = document.getElementById('upload-btn');
-        const progressContainer = document.getElementById('progress-container');
-        const progressFill = document.getElementById('progress-fill');
-        const progressText = document.getElementById('progress-text');
-
-        uploadArea.addEventListener('click', () => fileInput.click());
-
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        });
-
-        uploadArea.addEventListener('dragleave', () => {
-            uploadArea.classList.remove('dragover');
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const items = e.dataTransfer.items;
-            if (items) {
-                const files = [];
-                for (let i = 0; i < items.length; i++) {
-                    const item = items[i].webkitGetAsEntry();
-                    if (item) traverseFileTree(item, files);
-                }
-                setTimeout(() => { selectedFiles = files; updateFilePreviews(); }, 100);
-            } else {
-                selectedFiles = Array.from(e.dataTransfer.files);
-                updateFilePreviews();
-            }
-        });
-
-        function traverseFileTree(item, files) {
-            if (item.isFile) {
-                item.file(file => files.push(file));
-            } else if (item.isDirectory) {
-                const dirReader = item.createReader();
-                dirReader.readEntries(entries => {
-                    for (let i = 0; i < entries.length; i++) {
-                        traverseFileTree(entries[i], files);
-                    }
-                });
-            }
-        }
-
-        fileInput.addEventListener('change', (e) => {
-            selectedFiles = Array.from(e.target.files);
-            updateFilePreviews();
-        });
-
-        function formatSize(bytes) {
-            for (const unit of ['B', 'KB', 'MB', 'GB']) {
-                if (bytes < 1024) return bytes.toFixed(1) + ' ' + unit;
-                bytes /= 1024;
-            }
-            return bytes.toFixed(1) + ' TB';
-        }
-
-        function updateFilePreviews() {
-            filePreviews.innerHTML = '';
-            if (selectedFiles.length === 0) {
-                uploadBtn.style.display = 'none';
-                return;
-            }
-            selectedFiles.forEach(file => {
-                const div = document.createElement('div');
-                div.className = 'file-preview';
-                div.innerHTML = `<span class="file-preview-name">${file.name}</span><span class="file-preview-size">${formatSize(file.size)}</span>`;
-                filePreviews.appendChild(div);
-            });
-            uploadBtn.style.display = 'block';
-        }
-
-        uploadBtn.addEventListener('click', async () => {
-            if (selectedFiles.length === 0) return;
-            uploadCancelled = false;
-            uploadBtn.disabled = true;
-            uploadBtn.textContent = 'Uploading...';
-            progressContainer.style.display = 'block';
-
-            const totalSize = selectedFiles.reduce((sum, f) => sum + f.size, 0);
-            let uploadedSize = 0;
-
-            for (let i = 0; i < selectedFiles.length; i++) {
-                if (uploadCancelled) break;
-                const file = selectedFiles[i];
-                const formData = new FormData();
-                formData.append('file', file);
-                formData.append('filename', file.name);
-                formData.append('session_id', sessionId);
-
-                try {
-                    const xhr = new XMLHttpRequest();
-                    xhr.upload.addEventListener('progress', (e) => {
-                        if (e.lengthComputable) {
-                            const fileProgress = e.loaded / e.total;
-                            const currentUploaded = uploadedSize + (file.size * fileProgress);
-                            const percent = (currentUploaded / totalSize) * 100;
-                            progressFill.style.width = percent + '%';
-                            progressText.textContent = Math.round(percent) + '%';
-                        }
-                    });
-
-                    await new Promise((resolve, reject) => {
-                        xhr.addEventListener('load', () => {
-                            if (xhr.status === 200) {
-                                uploadedSize += file.size;
-                                resolve();
-                            } else if (xhr.status === 202) {
-                                showToast('Upload pending approval...');
-                                setTimeout(resolve, 2000);
-                            } else {
-                                reject(new Error(xhr.responseText || 'Upload failed'));
-                            }
-                        });
-                        xhr.addEventListener('error', () => reject(new Error('Network error')));
-                        xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
-                        xhr.open('POST', '/upload');
-                        xhr.send(formData);
-                    });
-                } catch (error) {
-                    showToast('Error: ' + error.message);
-                    break;
-                }
-            }
-
-            progressFill.style.width = '100%';
-            progressText.textContent = 'Complete!';
-            showToast('Upload complete!');
-            uploadBtn.disabled = false;
-            uploadBtn.textContent = 'Upload Files';
-            selectedFiles = [];
-            updateFilePreviews();
-            setTimeout(() => { progressContainer.style.display = 'none'; progressFill.style.width = '0%'; }, 2000);
-        });
-
-        function cancelUpload() {
-            uploadCancelled = true;
-            showToast('Upload cancelled');
-        }
     </script>
 </body>
 </html>"""
