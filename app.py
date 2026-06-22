@@ -2,6 +2,7 @@
 
 Textual-based terminal UI optimized for mobile Termux.
 Maximum 44 columns, 22 rows.
+Now includes Send to Browser (B) and Transfer Queue (T) screens.
 """
 
 import asyncio
@@ -13,8 +14,17 @@ from textual.reactive import reactive
 from textual.binding import Binding
 
 from ..config import get_config, MAX_TERMINAL_WIDTH, MAX_TERMINAL_HEIGHT, init_logging
-from ..core.engine import ShareXEngine
-from ..utils.terminal import check_terminal_size
+
+# =================================================================
+# NEW IMPORTS - ADD THESE (from 1_app_integration.py)
+# =================================================================
+from ..core.engine_integration import ExtendedEngine
+from ..ui.screens.send_to_browser import SendToBrowserScreen
+from ..ui.screens.transfer_queue_screen import TransferQueueScreen
+# =================================================================
+# END NEW IMPORTS
+# =================================================================
+
 from .screens.main_menu import MainMenuScreen
 from .screens.send_files import SendFilesScreen
 from .screens.receive_files import ReceiveFilesScreen
@@ -43,6 +53,8 @@ class ShareXApp(App):
         h: History
         t: Trusted Devices
         w: Web Share
+        b: Send to Browser (NEW)
+        t: Transfer Queue (NEW)
         escape: Back/Cancel
     """
 
@@ -145,6 +157,14 @@ class ShareXApp(App):
         Binding("h", "history", "History", show=True),
         Binding("w", "webshare", "WebShare", show=True),
         Binding("escape", "back", "Back", show=True),
+        # =================================================================
+        # NEW BINDINGS - ADD THESE (from 1_app_integration.py)
+        # =================================================================
+        Binding("b", "send_to_browser", "Send to Browser", show=True),  # NEW
+        Binding("t", "transfer_queue", "Transfer Queue", show=True),    # NEW
+        # =================================================================
+        # END NEW BINDINGS
+        # =================================================================
     ]
 
     SCREENS = {
@@ -163,17 +183,33 @@ class ShareXApp(App):
     def __init__(self) -> None:
         """Initialize ShareX application."""
         super().__init__()
-        self.engine: Optional[ShareXEngine] = None
+        self.engine: Optional[ExtendedEngine] = None
+        # =================================================================
+        # NEW ATTRIBUTES - ADD THESE (from 1_app_integration.py)
+        # =================================================================
+        self.webshare_manager = None
+        self.transfer_queue_screen = None
+        self.send_to_browser_screen = None
+        # =================================================================
+        # END NEW ATTRIBUTES
+        # =================================================================
         logger.info("ShareXApp initialized")
 
     def on_mount(self) -> None:
         """Handle app mount."""
-        # Initialize engine
-        self.engine = ShareXEngine(
+        # Initialize engine - MODIFIED: Use ExtendedEngine instead of ShareXEngine
+        # =================================================================
+        # NEW ENGINE INITIALIZATION (from 1_app_integration.py)
+        # =================================================================
+        self.engine = ExtendedEngine(
             on_device_update=self._on_device_update,
             on_transfer_update=self._on_transfer_update,
             on_notification=self._on_notification,
+            on_queue_change=self._on_queue_change,  # NEW callback
         )
+        # =================================================================
+        # END NEW ENGINE INITIALIZATION
+        # =================================================================
         self.push_screen("main_menu")
         logger.info("ShareXApp mounted")
 
@@ -194,6 +230,26 @@ class ShareXApp(App):
     def _on_notification(self, message: str, notification_type: str) -> None:
         """Handle notification."""
         logger.info(f"[{notification_type}] {message}")
+
+    # =================================================================
+    # NEW CALLBACK - ADD THIS (from 1_app_integration.py)
+    # =================================================================
+
+    def _on_queue_change(self, queue_items) -> None:
+        """Handle queue changes (NEW)."""
+        # Update queue screen if visible
+        if self.transfer_queue_screen and self.screen == self.transfer_queue_screen:
+            self.transfer_queue_screen.queue_items = queue_items
+            self.transfer_queue_screen._update_list(queue_items)
+            self.transfer_queue_screen._update_stats()
+
+    # =================================================================
+    # END NEW CALLBACK
+    # =================================================================
+
+    # =================================================================
+    # EXISTING ACTIONS (keep all your original action methods)
+    # =================================================================
 
     def action_send(self) -> None:
         """Action: Send files."""
@@ -219,6 +275,48 @@ class ShareXApp(App):
         """Action: Go back."""
         if len(self.screen_stack) > 1:
             self.pop_screen()
+
+    # =================================================================
+    # NEW ACTIONS - ADD THESE (from 1_app_integration.py)
+    # =================================================================
+
+    def action_send_to_browser(self) -> None:
+        """Open Send to Browser screen (NEW)."""
+        if not self.send_to_browser_screen:
+            self.send_to_browser_screen = SendToBrowserScreen(
+                webshare_manager=self.webshare_manager,
+            )
+        self.push_screen(self.send_to_browser_screen)
+
+    def action_transfer_queue(self) -> None:
+        """Open Transfer Queue screen (NEW)."""
+        if not self.transfer_queue_screen:
+            self.transfer_queue_screen = TransferQueueScreen(
+                transfer_queue=self.engine.transfer_queue,
+            )
+        self.push_screen(self.transfer_queue_screen)
+
+    # =================================================================
+    # END NEW ACTIONS
+    # =================================================================
+
+    # =================================================================
+    # WEBSHARE INTEGRATION - ADD THIS METHOD (from 1_app_integration.py)
+    # =================================================================
+
+    def setup_webshare(self, webshare_manager) -> None:
+        """Set up webshare manager and connect to engine."""
+        self.webshare_manager = webshare_manager
+        # NEW: Connect webshare to engine for browser push
+        self.engine.set_webshare_manager(webshare_manager)
+
+        # Update send_to_browser screen if exists
+        if self.send_to_browser_screen:
+            self.send_to_browser_screen.webshare_manager = webshare_manager
+
+    # =================================================================
+    # END WEBSHARE INTEGRATION
+    # =================================================================
 
     def get_css(self) -> str:
         """Get CSS with terminal size constraints."""
