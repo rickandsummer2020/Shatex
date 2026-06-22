@@ -2,7 +2,6 @@
 
 Handles SQLite persistence for history, trusted devices,
 settings, and logs.
-Now includes queue state and transfer checkpoint support.
 """
 
 import sqlite3
@@ -25,8 +24,7 @@ class DatabaseManager:
     """Manages SQLite database operations.
 
     Provides persistent storage for application data
-    including transfer history, trusted devices, settings,
-    queue states, and transfer checkpoints.
+    including transfer history, trusted devices, and settings.
 
     Attributes:
         db_path: Path to SQLite database file.
@@ -549,10 +547,17 @@ class DatabaseManager:
             logger.error(f"Failed to clear logs: {e}")
             return False
 
-    # =================================================================
-    # NEW METHODS - ADD THESE (from 3_db_extensions.py)
-    # Queue State and Transfer Checkpoint Support
-    # =================================================================
+    def close(self) -> None:
+        """Close database connection."""
+        if self.connection:
+            self.connection.close()
+            self.connection = None
+            logger.info("Database connection closed")
+
+
+    # =====================================================================
+    # QUEUE & RESUME EXTENSIONS
+    # =====================================================================
 
     def save_queue_state(self, state: dict) -> None:
         """Save queue state to database.
@@ -560,7 +565,7 @@ class DatabaseManager:
         Args:
             state: Queue state dictionary.
         """
-        cursor = self.connection.cursor()
+        cursor = self.conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS queue_state (
                 id INTEGER PRIMARY KEY,
@@ -572,7 +577,7 @@ class DatabaseManager:
             INSERT OR REPLACE INTO queue_state (id, state_json, updated_at)
             VALUES (1, ?, unixepoch())
         """, (json.dumps(state),))
-        self.connection.commit()
+        self.conn.commit()
 
     def load_queue_state(self) -> Optional[dict]:
         """Load queue state from database.
@@ -580,10 +585,8 @@ class DatabaseManager:
         Returns:
             Queue state dictionary or None.
         """
-        cursor = self.connection.cursor()
-        cursor.execute("""
-            SELECT state_json FROM queue_state WHERE id = 1
-        """)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT state_json FROM queue_state WHERE id = 1")
         row = cursor.fetchone()
         if row:
             return json.loads(row[0])
@@ -595,7 +598,7 @@ class DatabaseManager:
         Args:
             checkpoint: Checkpoint dictionary with transfer_id.
         """
-        cursor = self.connection.cursor()
+        cursor = self.conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transfer_checkpoints (
                 transfer_id TEXT PRIMARY KEY,
@@ -608,7 +611,7 @@ class DatabaseManager:
             (transfer_id, checkpoint_json, updated_at)
             VALUES (?, ?, unixepoch())
         """, (checkpoint["transfer_id"], json.dumps(checkpoint)))
-        self.connection.commit()
+        self.conn.commit()
 
     def load_checkpoint(self, transfer_id: str) -> Optional[dict]:
         """Load checkpoint by transfer ID.
@@ -619,10 +622,9 @@ class DatabaseManager:
         Returns:
             Checkpoint dictionary or None.
         """
-        cursor = self.connection.cursor()
+        cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT checkpoint_json FROM transfer_checkpoints
-            WHERE transfer_id = ?
+            SELECT checkpoint_json FROM transfer_checkpoints WHERE transfer_id = ?
         """, (transfer_id,))
         row = cursor.fetchone()
         if row:
@@ -635,7 +637,7 @@ class DatabaseManager:
         Returns:
             List of checkpoint dictionaries.
         """
-        cursor = self.connection.cursor()
+        cursor = self.conn.cursor()
         cursor.execute("SELECT checkpoint_json FROM transfer_checkpoints")
         return [json.loads(row[0]) for row in cursor.fetchall()]
 
@@ -645,23 +647,12 @@ class DatabaseManager:
         Args:
             transfer_id: Transfer ID.
         """
-        cursor = self.connection.cursor()
+        cursor = self.conn.cursor()
         cursor.execute(
             "DELETE FROM transfer_checkpoints WHERE transfer_id = ?",
             (transfer_id,)
         )
-        self.connection.commit()
-
-    # =================================================================
-    # END OF NEW METHODS
-    # =================================================================
-
-    def close(self) -> None:
-        """Close database connection."""
-        if self.connection:
-            self.connection.close()
-            self.connection = None
-            logger.info("Database connection closed")
+        self.conn.commit()
 
     def __del__(self) -> None:
         """Cleanup on destruction."""
