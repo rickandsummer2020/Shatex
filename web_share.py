@@ -2,10 +2,9 @@
 
 Provides UI for managing web share sessions including
 start/stop, QR code display, file management, upload
-approvals, and live browser status.
+approvals, and live browser status via WebSocket.
 
-ENHANCED: Live browser count, browser session display,
-real-time browser status updates.
+WEBSOCKET: Real-time updates replace polling loops.
 """
 
 import asyncio
@@ -28,7 +27,6 @@ from textual.widgets import (
     Header,
     Footer,
 )
-from textual.worker import Worker, WorkerState
 
 from ..services.webshare_manager import WebShareManager
 from ..services.webshare_server import UploadRequest, BrowserSession
@@ -46,14 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 class WebShareScreen(Screen):
-    """Screen for managing web share sessions.
-
-    Allows users to start/stop web share, view QR code,
-    manage shared files, approve uploads, and monitor
-    connected browser sessions.
-
-    ENHANCED: Live browser status display and updates.
-    """
+    """Screen for managing web share sessions with WebSocket real-time updates."""
 
     CSS = """
     Screen { align: center middle; }
@@ -173,7 +164,7 @@ class WebShareScreen(Screen):
 
     .browser-section {
         height: auto;
-        max-height: 10;
+        max-height: 12;
         border: solid $primary-darken-2;
         padding: 1;
         margin: 1 0;
@@ -216,6 +207,15 @@ class WebShareScreen(Screen):
         color: $text-muted;
         text-style: italic;
     }
+
+    .ws-indicator {
+        text-align: center;
+        color: $text-muted;
+        padding: 0 0 1 0;
+    }
+
+    .ws-connected { color: $success; }
+    .ws-disconnected { color: $error; }
     """
 
     BINDINGS = [
@@ -226,7 +226,7 @@ class WebShareScreen(Screen):
         ("c", "clear_files", "Clear Files"),
     ]
 
-    # Reactive properties for live updates
+    # Reactive properties
     is_sharing: reactive[bool] = reactive(False)
     session_url: reactive[str] = reactive("")
     session_status: reactive[str] = reactive("inactive")
@@ -234,35 +234,35 @@ class WebShareScreen(Screen):
     uploaded_files_count: reactive[int] = reactive(0)
     session_duration: reactive[str] = reactive("0s")
 
-    # NEW: Browser session reactive properties
+    # Browser session reactive properties
     browser_count: reactive[int] = reactive(0)
     browser_sessions: reactive[List[dict]] = reactive([])
     total_browser_downloads: reactive[int] = reactive(0)
     total_browser_uploads: reactive[int] = reactive(0)
     total_browser_bytes: reactive[str] = reactive("0 B")
+    websocket_count: reactive[int] = reactive(0)
 
     def __init__(self, webshare_manager: Optional[WebShareManager] = None) -> None:
-        """Initialize web share screen.
-
-        Args:
-            webshare_manager: WebShareManager instance.
-        """
+        """Initialize web share screen."""
         super().__init__()
-        self.webshare_manager = webshare_manager
-        self._update_task: Optional[asyncio.Task] = None
+        if webshare_manager is None:
+            self.webshare_manager = WebShareManager(
+                on_upload_request=self._handle_upload_request,
+                on_browser_update=self._handle_browser_update,
+                on_status_change=self._handle_status_change,
+            )
+        else:
+            self.webshare_manager = webshare_manager
         self._pending_uploads: List[UploadRequest] = []
-        self._browser_update_task: Optional[asyncio.Task] = None
 
     def compose(self) -> ComposeResult:
         """Compose the screen layout."""
         yield Header(show_clock=True)
 
         with Container(classes="webshare-container"):
-            # Header
             with Container(classes="header-section"):
                 yield Static("Web Share", classes="title")
 
-            # Status bar
             with Container(classes="status-bar"):
                 yield Static(
                     "Status: Not Sharing",
@@ -270,12 +270,10 @@ class WebShareScreen(Screen):
                     classes="status-inactive",
                 )
 
-            # QR Code section (visible when sharing)
             with Container(classes="qr-section", id="qr-section"):
                 yield Static("", classes="qr-code", id="qr-code")
                 yield Static("", classes="url-display", id="url-display")
 
-            # Info grid
             with Container(classes="info-grid", id="info-grid"):
                 with Container(classes="info-item"):
                     yield Static("Files:", classes="info-label")
@@ -290,13 +288,18 @@ class WebShareScreen(Screen):
                     yield Static("Port:", classes="info-label")
                     yield Static("-", classes="info-value", id="port")
 
-            # NEW: Browser sessions section
+            # Browser sessions section
             with Container(classes="browser-section", id="browser-section"):
                 yield Static("Connected Browsers", classes="section-title")
                 yield Static(
                     "No browsers connected",
                     classes="browser-count",
                     id="browser-count",
+                )
+                yield Static(
+                    "WS: 0 connected",
+                    classes="ws-indicator",
+                    id="ws-indicator",
                 )
                 with Container(classes="browser-stats", id="browser-stats"):
                     with Container(classes="browser-stat"):
@@ -310,7 +313,6 @@ class WebShareScreen(Screen):
                         yield Static("Transferred", classes="browser-stat-label")
                 yield ListView(id="browser-list")
 
-            # Files section
             with Container(classes="files-section"):
                 yield Static("Shared Files", classes="section-title")
                 yield ListView(id="file-list")
@@ -320,7 +322,6 @@ class WebShareScreen(Screen):
                     id="empty-files",
                 )
 
-            # Pending uploads
             with Container(classes="uploads-section", id="uploads-section"):
                 yield Static("Pending Uploads", classes="section-title")
                 yield Static(
@@ -329,98 +330,22 @@ class WebShareScreen(Screen):
                     id="empty-uploads",
                 )
 
-            # Controls
             with Container(classes="controls"):
                 with Horizontal():
-                    yield Button(
-                        "Start Sharing",
-                        id="btn-start",
-                        variant="success",
-                        classes="btn-start",
-                    )
-                    yield Button(
-                        "Stop Sharing",
-                        id="btn-stop",
-                        variant="error",
-                        classes="btn-stop",
-                        disabled=True,
-                    )
-                    yield Button(
-                        "Add Files",
-                        id="btn-add",
-                        variant="primary",
-                        classes="btn-add",
-                    )
-                    yield Button(
-                        "Clear Files",
-                        id="btn-clear",
-                        variant="warning",
-                        classes="btn-clear",
-                    )
+                    yield Button("Start Sharing", id="btn-start", variant="success", classes="btn-start")
+                    yield Button("Stop Sharing", id="btn-stop", variant="error", classes="btn-stop", disabled=True)
+                    yield Button("Add Files", id="btn-add", variant="primary", classes="btn-add")
+                    yield Button("Clear Files", id="btn-clear", variant="warning", classes="btn-clear")
 
         yield Footer()
 
     def on_mount(self) -> None:
         """Handle screen mount."""
         self._update_ui_state()
-        self._start_update_loop()
-        self._start_browser_update_loop()  # NEW
 
     def on_unmount(self) -> None:
         """Handle screen unmount."""
-        self._stop_update_loop()
-        self._stop_browser_update_loop()  # NEW
-
-    def _start_update_loop(self) -> None:
-        """Start periodic UI update loop."""
-        if self._update_task is None:
-            self._update_task = asyncio.create_task(self._update_loop())
-
-    def _stop_update_loop(self) -> None:
-        """Stop periodic UI update loop."""
-        if self._update_task:
-            self._update_task.cancel()
-            self._update_task = None
-
-    # NEW: Browser update loop
-    def _start_browser_update_loop(self) -> None:
-        """Start periodic browser status update loop."""
-        if self._browser_update_task is None:
-            self._browser_update_task = asyncio.create_task(
-                self._browser_update_loop()
-            )
-
-    def _stop_browser_update_loop(self) -> None:
-        """Stop periodic browser status update loop."""
-        if self._browser_update_task:
-            self._browser_update_task.cancel()
-            self._browser_update_task = None
-
-    async def _update_loop(self) -> None:
-        """Periodic update loop for session info."""
-        try:
-            while True:
-                await asyncio.sleep(2)
-                if self.webshare_manager and self.webshare_manager.is_running:
-                    self._update_session_info()
-                    self._update_uploads_list()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Update loop error: {e}")
-
-    # NEW: Browser update loop
-    async def _browser_update_loop(self) -> None:
-        """Periodic update loop for browser sessions."""
-        try:
-            while True:
-                await asyncio.sleep(3)  # Update every 3 seconds
-                if self.webshare_manager and self.webshare_manager.is_running:
-                    self._update_browser_info()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Browser update loop error: {e}")
+        pass  # No polling tasks to cancel
 
     def _update_session_info(self) -> None:
         """Update reactive properties from manager."""
@@ -434,29 +359,13 @@ class WebShareScreen(Screen):
             self.shared_files_count = info.get("files_count", 0)
             self.uploaded_files_count = info.get("uploaded_count", 0)
             self.session_duration = info.get("duration", "0s")
-
-            # NEW: Update browser reactive properties
             self.browser_count = info.get("browser_count", 0)
             self.browser_sessions = info.get("browser_sessions", [])
             self.total_browser_downloads = info.get("total_browser_downloads", 0)
             self.total_browser_uploads = info.get("total_browser_uploads", 0)
             total_bytes = info.get("total_browser_bytes", 0)
             self.total_browser_bytes = self._format_size(total_bytes)
-
-    def _update_browser_info(self) -> None:
-        """Update browser session display."""
-        if not self.webshare_manager or not self.webshare_manager.is_running:
-            return
-
-        try:
-            summary = self.webshare_manager.get_browser_summary()
-            self.browser_count = summary["count"]
-            self.browser_sessions = summary["browsers"]
-            self.total_browser_downloads = summary["total_downloads"]
-            self.total_browser_uploads = summary["total_uploads"]
-            self.total_browser_bytes = self._format_size(summary["total_bytes"])
-        except Exception as e:
-            logger.error(f"Error updating browser info: {e}")
+            self.websocket_count = info.get("websocket_count", 0)
 
     def _update_uploads_list(self) -> None:
         """Update pending uploads display."""
@@ -469,24 +378,105 @@ class WebShareScreen(Screen):
         uploads_container = self.query_one("#uploads-section", Container)
         empty_uploads = self.query_one("#empty-uploads", Static)
 
+        # Clear old items
+        for child in list(uploads_container.children):
+            if isinstance(child, Static) and child.id != "empty-uploads":
+                child.remove()
+
         if uploads:
             empty_uploads.display = False
-            # Clear and rebuild upload list
-            for child in list(uploads_container.children):
-                if isinstance(child, Static) and child.id != "empty-uploads":
-                    child.remove()
-
             for upload in uploads:
                 upload_text = f"{upload.filename} ({self._format_size(upload.file_size)}) from {upload.client_ip}"
-                uploads_container.mount(
-                    Static(upload_text, classes="upload-item")
-                )
+                uploads_container.mount(Static(upload_text, classes="upload-item"))
         else:
             empty_uploads.display = True
-            # Clear upload items
-            for child in list(uploads_container.children):
-                if isinstance(child, Static) and child.id != "empty-uploads":
-                    child.remove()
+
+    # =====================================================================
+    # WEBSOCKET CALLBACKS (Real-time updates, no polling)
+    # =====================================================================
+
+    def _handle_status_change(self, status: WebShareStatus) -> None:
+        """Handle server status change from WebSocket.
+
+        Called by WebShareManager when server status changes.
+        """
+        self.session_status = status.value
+        if status == WebShareStatus.ACTIVE:
+            self.is_sharing = True
+            self._update_session_info()
+            self._update_uploads_list()
+        elif status in (WebShareStatus.STOPPED, WebShareStatus.ERROR):
+            self.is_sharing = False
+            self.session_url = ""
+            self.shared_files_count = 0
+            self.uploaded_files_count = 0
+            self.session_duration = "0s"
+            self.browser_count = 0
+            self.browser_sessions = []
+            self.total_browser_downloads = 0
+            self.total_browser_uploads = 0
+            self.total_browser_bytes = "0 B"
+            self.websocket_count = 0
+
+    def _handle_browser_update(self, sessions: List[BrowserSession]) -> None:
+        """Handle real-time browser update from WebSocket.
+
+        Called by WebShareServer when browser sessions change.
+        No polling needed - updates arrive in real-time.
+        """
+        try:
+            self.browser_count = len(sessions)
+            self.browser_sessions = [s.to_dict() for s in sessions]
+            self.total_browser_downloads = sum(s.files_downloaded for s in sessions)
+            self.total_browser_uploads = sum(s.files_uploaded for s in sessions)
+            total_bytes = sum(s.bytes_transferred for s in sessions)
+            self.total_browser_bytes = self._format_size(total_bytes)
+
+            # Count WebSocket connections
+            self.websocket_count = sum(1 for s in sessions if s.is_websocket)
+
+            # Notify user of new connections
+            current_count = len(sessions)
+            last_count = getattr(self, '_last_browser_count', 0)
+            if current_count > last_count:
+                new_count = current_count - last_count
+                self.app.notify(
+                    f"{new_count} new browser{"s" if new_count > 1 else ""} connected",
+                    severity="information"
+                )
+            self._last_browser_count = current_count
+
+            # Update uploads list too (might have changed)
+            self._update_uploads_list()
+
+        except Exception as e:
+            logger.error(f"Browser update handler error: {e}")
+
+    async def _handle_upload_request(self, request: UploadRequest) -> bool:
+        """Handle upload approval request.
+
+        Args:
+            request: Upload request to approve.
+
+        Returns:
+            True if approved.
+        """
+        try:
+            result = await self.app.push_screen_wait(
+                UploadApprovalDialog(
+                    filename=request.filename,
+                    file_size=self._format_size(request.file_size),
+                    client_ip=request.client_ip,
+                )
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Upload approval error: {e}")
+            return False
+
+    # =====================================================================
+    # WATCHERS (Reactive property updates)
+    # =====================================================================
 
     def watch_is_sharing(self, sharing: bool) -> None:
         """Watch is_sharing changes."""
@@ -528,7 +518,6 @@ class WebShareScreen(Screen):
         duration_display = self.query_one("#duration", Static)
         duration_display.update(duration)
 
-    # NEW: Watch browser reactive properties
     def watch_browser_count(self, count: int) -> None:
         """Watch browser_count changes."""
         browser_count = self.query_one("#browser-count", Static)
@@ -539,6 +528,16 @@ class WebShareScreen(Screen):
         else:
             browser_count.update(f"{count} browsers connected")
 
+    def watch_websocket_count(self, count: int) -> None:
+        """Watch websocket_count changes."""
+        ws_indicator = self.query_one("#ws-indicator", Static)
+        if count == 0:
+            ws_indicator.update("WS: 0 connected")
+            ws_indicator.classes = "ws-disconnected"
+        else:
+            ws_indicator.update(f"WS: {count} connected")
+            ws_indicator.classes = "ws-connected"
+
     def watch_browser_sessions(self, sessions: List[dict]) -> None:
         """Watch browser_sessions changes."""
         browser_list = self.query_one("#browser-list", ListView)
@@ -547,11 +546,19 @@ class WebShareScreen(Screen):
         if sessions:
             for session in sessions:
                 display_name = session.get("display_name", "Unknown Browser")
-                duration = session.get("duration", "0s")
+                ip = session.get("ip_address", "unknown")
+                is_active = session.get("is_active", False)
+                is_ws = session.get("is_websocket", False)
+                status = "Active" if is_active else "Inactive"
+                ws_badge = " [WS]" if is_ws else ""
+                heartbeat = session.get("heartbeat_ago", "unknown")
                 downloads = session.get("files_downloaded", 0)
                 uploads = session.get("files_uploaded", 0)
 
-                text = f"{display_name} - {duration} | ↓{downloads} ↑{uploads}"
+                # Compact format for 44-column terminal
+                line1 = f"{display_name}{ws_badge}"
+                line2 = f"  {ip} | {status} | {heartbeat} | ↓{downloads}↑{uploads}"
+                text = f"{line1}\n{line2}"
                 browser_list.append(ListItem(Static(text, classes="browser-item")))
         else:
             browser_list.append(ListItem(Static("No active browsers", classes="empty-state")))
@@ -598,6 +605,10 @@ class WebShareScreen(Screen):
             btn_add.disabled = True
             btn_clear.disabled = True
 
+    # =====================================================================
+    # BUTTON HANDLERS
+    # =====================================================================
+
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses."""
         button_id = event.button.id
@@ -615,24 +626,16 @@ class WebShareScreen(Screen):
         """Start web share session."""
         try:
             if not self.webshare_manager:
-                self.app.push_screen(
-                    ErrorDialog("WebShareManager not available")
-                )
+                self.app.push_screen(ErrorDialog("WebShareManager not available"))
                 return
-
-            # Get files from engine
-            files = []
-            if hasattr(self.app, "engine") and self.app.engine:
-                # Try to get selected files from engine
-                pass
 
             # Create session
             session = await self.webshare_manager.create_session(
-                files=files,
+                files=[],
                 allow_upload=True,
             )
 
-            # Start server with callbacks
+            # Start server with callbacks (WebSocket enabled)
             await self.webshare_manager.start_server()
 
             self.is_sharing = True
@@ -653,9 +656,7 @@ class WebShareScreen(Screen):
 
         except Exception as e:
             logger.error(f"Failed to start web share: {e}")
-            self.app.push_screen(
-                ErrorDialog(f"Failed to start web share: {e}")
-            )
+            self.app.push_screen(ErrorDialog(f"Failed to start web share: {e}"))
 
     async def _stop_sharing(self) -> None:
         """Stop web share session."""
@@ -669,22 +670,19 @@ class WebShareScreen(Screen):
             self.shared_files_count = 0
             self.uploaded_files_count = 0
             self.session_duration = "0s"
-
-            # NEW: Reset browser stats
             self.browser_count = 0
             self.browser_sessions = []
             self.total_browser_downloads = 0
             self.total_browser_uploads = 0
             self.total_browser_bytes = "0 B"
+            self.websocket_count = 0
 
             self.app.notify("Web share stopped", severity="information")
             logger.info("Web share stopped")
 
         except Exception as e:
             logger.error(f"Error stopping web share: {e}")
-            self.app.push_screen(
-                ErrorDialog(f"Error stopping web share: {e}")
-            )
+            self.app.push_screen(ErrorDialog(f"Error stopping web share: {e}"))
 
     async def _add_files(self) -> None:
         """Add files to web share session."""
@@ -692,104 +690,26 @@ class WebShareScreen(Screen):
             if not self.webshare_manager or not self.webshare_manager.is_running:
                 self.app.notify("Start sharing first", severity="warning")
                 return
-
-            # Show file picker or get files from engine
-            # For now, show a message
             self.app.notify("File selection not implemented in UI", severity="warning")
-
         except Exception as e:
             logger.error(f"Error adding files: {e}")
-            self.app.push_screen(
-                ErrorDialog(f"Error adding files: {e}")
-            )
+            self.app.push_screen(ErrorDialog(f"Error adding files: {e}"))
 
     async def _clear_files(self) -> None:
         """Clear shared files."""
         try:
             if not self.webshare_manager or not self.webshare_manager.is_running:
                 return
-
-            # Clear files from session
             if self.webshare_manager.current_session:
                 self.webshare_manager.current_session.files = []
                 self.shared_files_count = 0
-
             self.app.notify("Shared files cleared", severity="information")
-
         except Exception as e:
             logger.error(f"Error clearing files: {e}")
 
-    async def _handle_upload_request(self, request: UploadRequest) -> bool:
-        """Handle upload approval request.
-
-        Args:
-            request: Upload request to approve.
-
-        Returns:
-            True if approved.
-        """
-        try:
-            # Show approval dialog
-            result = await self.app.push_screen_wait(
-                UploadApprovalDialog(
-                    filename=request.filename,
-                    file_size=self._format_size(request.file_size),
-                    client_ip=request.client_ip,
-                )
-            )
-            return result
-        except Exception as e:
-            logger.error(f"Upload approval error: {e}")
-            return False
-
-    def _handle_browser_update(self, sessions: List[BrowserSession]) -> None:
-        """Handle browser session updates from server.
-
-        NEW: Callback for real-time browser updates.
-
-        Args:
-            sessions: Updated browser sessions.
-        """
-        try:
-            # Update reactive properties
-            self.browser_count = len(sessions)
-            self.browser_sessions = [s.to_dict() for s in sessions]
-
-            # Calculate totals
-            self.total_browser_downloads = sum(s.files_downloaded for s in sessions)
-            self.total_browser_uploads = sum(s.files_uploaded for s in sessions)
-            total_bytes = sum(s.bytes_transferred for s in sessions)
-            self.total_browser_bytes = self._format_size(total_bytes)
-
-            # Notify user of new connections
-            if len(sessions) > getattr(self, '_last_browser_count', 0):
-                new_count = len(sessions) - getattr(self, '_last_browser_count', 0)
-                if new_count > 0:
-                    self.app.notify(
-                        f"{new_count} new browser{'s' if new_count > 1 else ''} connected",
-                        severity="information"
-                    )
-
-            self._last_browser_count = len(sessions)
-
-        except Exception as e:
-            logger.error(f"Browser update handler error: {e}")
-
-    @staticmethod
-    def _format_size(size: int) -> str:
-        """Format bytes to human-readable string.
-
-        Args:
-            size: Size in bytes.
-
-        Returns:
-            Formatted string.
-        """
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} PB"
+    # =====================================================================
+    # ACTIONS
+    # =====================================================================
 
     def action_toggle_share(self) -> None:
         """Toggle web share on/off."""
@@ -806,6 +726,19 @@ class WebShareScreen(Screen):
         """Clear files action."""
         asyncio.create_task(self._clear_files())
 
+    # =====================================================================
+    # UTILITIES
+    # =====================================================================
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        """Format bytes to human-readable string."""
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} PB"
+
     def _show_demo_data(self) -> None:
         """Show demo data when engine is not available."""
         self.is_sharing = True
@@ -814,19 +747,24 @@ class WebShareScreen(Screen):
         self.shared_files_count = 3
         self.uploaded_files_count = 1
         self.session_duration = "5m 30s"
-
-        # NEW: Demo browser data
         self.browser_count = 2
+        self.websocket_count = 1
         self.browser_sessions = [
             {
                 "display_name": "Chrome on Android",
-                "duration": "2m 15s",
+                "ip_address": "192.168.1.5",
+                "is_active": True,
+                "is_websocket": True,
+                "heartbeat_ago": "5s ago",
                 "files_downloaded": 1,
                 "files_uploaded": 0,
             },
             {
                 "display_name": "Safari on iOS",
-                "duration": "1m 45s",
+                "ip_address": "192.168.1.8",
+                "is_active": True,
+                "is_websocket": False,
+                "heartbeat_ago": "12s ago",
                 "files_downloaded": 0,
                 "files_uploaded": 1,
             },
@@ -835,7 +773,6 @@ class WebShareScreen(Screen):
         self.total_browser_uploads = 1
         self.total_browser_bytes = "15.5 MB"
 
-        # Update QR code
         qr_display = self.query_one("#qr-code", Static)
         qr_display.update("█▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█\n" +
                          "█  ▄▄▄▄▄  ▄▄▄▄▄  ▄▄▄▄▄  ▄▄▄▄▄  ▄▄▄▄▄  █\n" +
@@ -844,7 +781,6 @@ class WebShareScreen(Screen):
                          "█  ▀▀▀▀▀  ▀▀▀▀▀  ▀▀▀▀▀  ▀▀▀▀▀  ▀▀▀▀▀  █\n" +
                          "█▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀█")
 
-        # Update file list
         file_list = self.query_one("#file-list", ListView)
         file_list.append(ListItem(Static("document.pdf (2.5 MB)")))
         file_list.append(ListItem(Static("image.jpg (1.8 MB)")))
